@@ -81,7 +81,16 @@ class ELMDataset(VQADataset, __DisplMixin):
                 if line_number>=(self.num_threshold-1000):
                     self.num_to_vocab[line_number] = line_content
 
-        self.default_drivelm(ann_paths)
+        # self.default_drivelm(ann_paths)
+        self.tmp_imglist = []
+        # self.temporal_length = 1
+        # self.default_boxqa(ann_paths)
+
+        # self.default_boxqa_det_track_pred(ann_paths)
+        self.configure_traffic()
+        self.default_traffic()
+        self.default_drivelm()
+
         print("The number of data: ", len(self.questions))
 
 
@@ -91,9 +100,17 @@ class ELMDataset(VQADataset, __DisplMixin):
             data_infos = pickle.load(f)
         
         data_infos = list(data_infos.values())
+        
+        # data_infos = random.sample(data_infos, 90)
+
+        nuscenes_info = pickle.load(open("data/nuscenes/bevdetv2-nuscenes_infos_train.pkl", "rb"))["infos"]
+        self.traffic_element_dict = {}
+        for cur_nuscenes_info in nuscenes_info:
+            self.traffic_element_dict[cur_nuscenes_info['scene_token']] = {}
+
         num=0
         
-        for info in tqdm(data_infos):
+        for info in tqdm.tqdm(data_infos):
             ann_info = info['annotation']
             timestamp = info['timestamp']
             scene_id = info['meta_data']['source_id']
@@ -122,6 +139,23 @@ class ELMDataset(VQADataset, __DisplMixin):
 
 
     def default_traffic(self):
+        self.te_convert = {
+            0:  'unknown',
+            1:  'red',
+            2:  'green',
+            3:  'yellow',
+            4:  'go_straight',
+            5:  'turn_left',
+            6:  'turn_right',
+            7:  'no_left_turn',
+            8:  'no_right_turn',
+            9:  'u_turn',
+            10: 'no_u_turn',
+            11: 'slight_left',
+            12: 'slight_right',
+        }
+
+        self.temporal_length = 6
         self.data_info = pickle.load(open("data/nuscenes/bevdetv2-nuscenes_infos_trainval.pkl", "rb"))["infos"]
 
         neg_num = 0
@@ -204,23 +238,48 @@ class ELMDataset(VQADataset, __DisplMixin):
                 if length==15:
                     Traffic_a = f'Yes. The ego vehicle has seen {element_counts[longest_list[0]]} {self.te_convert[longest_list[0]]}, {element_counts[longest_list[1]]} {self.te_convert[longest_list[1]]}, {element_counts[longest_list[2]]} {self.te_convert[longest_list[2]]}, {element_counts[longest_list[3]]} {self.te_convert[longest_list[3]]}, {element_counts[longest_list[4]]} {self.te_convert[longest_list[4]]}, {element_counts[longest_list[5]]} {self.te_convert[longest_list[5]]}, {element_counts[longest_list[6]]} {self.te_convert[longest_list[6]]}, {element_counts[longest_list[7]]} {self.te_convert[longest_list[7]]}, {element_counts[longest_list[8]]} {self.te_convert[longest_list[8]]}, {element_counts[longest_list[9]]} {self.te_convert[longest_list[9]]}, {element_counts[longest_list[10]]} {self.te_convert[longest_list[10]]}, {element_counts[longest_list[11]]} {self.te_convert[longest_list[11]]}, {element_counts[longest_list[12]]} {self.te_convert[longest_list[12]]}, {element_counts[longest_list[13]]} {self.te_convert[longest_list[13]]} and {element_counts[longest_list[14]]} {self.te_convert[longest_list[14]]} before.'
 
-            if (length == 0 and idx % 3 == 0) or (length != 0):
-                if length == 0:
-                    neg_num += 1
-                else:
-                    pos_num += 1
-                self.images.append(image_path)
-                self.tmp_imglist.append(tmp_image)
-                self.questions.append(Traffic_q)
-                self.answers.append([Traffic_a])
+                if (length == 0 and idx % 3 == 0) or (length != 0):
+                    if length == 0:
+                        neg_num += 1
+                    else:
+                        pos_num += 1
+                    self.images.append(image_path)
+                    cur_tmp_image = tmp_image + [image_path]
+                    self.tmp_imglist.append(cur_tmp_image)
+                    self.questions.append(Traffic_q)
+                    self.answers.append([Traffic_a])
         
         print("The number of traffic questions: ", len(self.questions))
         print("The number of positive questions: ", pos_num)
         print("The number of negative questions: ", neg_num)
 
 
-    def default_drivelm(self, ann_paths):
-        self.annotation = json.load(open(ann_paths[0], "r"))
+    # def default_drivelm(self, ann_paths):
+    def default_drivelm(self):
+        self.temporal_length = 6
+
+        # self.annotation = json.load(open(ann_paths[0], "r"))
+        self.annotation = json.load(open('data/drivelm_train.json', "r"))
+        
+        # all_scene_w_behavior = []
+        # for cur_scene_value in self.annotation.values():
+        #     for cur_key_frame_value in cur_scene_value['key_frame'].values():
+        #         if 'Perception' in cur_key_frame_value:
+        #             cur_perception = cur_key_frame_value['Perception']
+
+        #             for cur_perception_value in cur_perception['q']:
+        #                 if 'behavior' in cur_perception_value:
+        #                     all_scene_w_behavior.append(cur_key_frame_value)
+        #                     print(cur_perception_value)
+
+        #         if 'Prediction and Planning' in cur_key_frame_value:
+        #             cur_pred_plan = cur_key_frame_value['Prediction and Planning']
+
+        #             for cur_pred_plan_value in cur_pred_plan['q']:
+        #                 if 'behavior' in cur_pred_plan_value:
+        #                     all_scene_w_behavior.append(cur_key_frame_value)
+        #                     print(cur_pred_plan_value)
+                
         self.data_info = pickle.load(open("data/nuscenes/bevdetv2-nuscenes_infos_train.pkl", "rb"))["infos"]
         for idx, info in enumerate(self.data_info):
             scene_token = info['scene_token']
@@ -234,6 +293,23 @@ class ELMDataset(VQADataset, __DisplMixin):
             scene_key_frame = value['key_frame']
             frame_id = str(timestamp)
             if frame_id in scene_key_frame:
+                # temporal data only for image path
+                tmp_image = []
+                for tmp in range(1, self.temporal_length+1):
+                    if scene_token != self.data_info[idx-tmp]['scene_token']:
+                        continue
+                    tmp_path = self.data_info[idx-tmp]['cams']['CAM_FRONT']['data_path']
+                    tmp_image.append(tmp_path)
+
+                # if the image path is not equal self.temporal length, then use the duplicate image path
+                tmp_image = tmp_image[::-1]
+                if len(tmp_image) != self.temporal_length:
+                    if len(tmp_image) != 0:
+                        tmp_image = tmp_image[:1] * (self.temporal_length - len(tmp_image)) + tmp_image
+                    else:
+                        tmp_image = [image_path] * self.temporal_length
+                assert len(tmp_image) == self.temporal_length
+
                 value1 = scene_key_frame[frame_id]
 
                 if "Perception" in value1:
@@ -255,12 +331,14 @@ class ELMDataset(VQADataset, __DisplMixin):
                 Answer = Perception_a + Prediction_a
 
             
-            assert len(Question) == len(Answer)
+                assert len(Question) == len(Answer)
 
-            for idx in range(len(Question)):                
-                self.questions.append(Question[idx])
-                self.answers.append([Answer[idx]])
-                self.images.append(image_path)
+                for idx in range(len(Question)):                
+                    self.questions.append(Question[idx])
+                    self.answers.append([Answer[idx]])
+                    self.images.append(image_path)
+                    cur_tmp_image = tmp_image + [image_path]
+                    self.tmp_imglist.append(cur_tmp_image)
 
 
     def default_ego4d(self):
@@ -316,8 +394,20 @@ class ELMDataset(VQADataset, __DisplMixin):
                         self.answers.append([narration['narration_text'][3:]])
                         self.images.append(img_path)
 
-    def default_boxqa(self, ann_paths):
-        self.annotation = json.load(open("data/box_detection_train.json", "r"))
+    def default_boxqa(self, ann_paths, ann_type, temporal_length):
+        # self.annotation = json.load(open("data/box_detection_train.json", "r"))
+        # self.annotation = json.load(open("data/tracking_train.json", "r"))
+        # self.annotation = json.load(open("data/box_prediction_train.json", "r"))
+        # self.annotation = json.load(open("data/planning_train.json", "r"))
+
+        self.annotation = json.load(open(ann_paths, "r"))
+
+        # first_key, first_value = next(iter(self.annotation.items()))
+        # self.annotation = {}
+        # self.annotation[first_key] = first_value
+
+        self.temporal_length = temporal_length
+
         self.data_info = pickle.load(open("data/nuscenes/bevdetv2-nuscenes_infos_trainval.pkl", "rb"))["infos"]
         for idx, info in enumerate(self.data_info):
             scene_token = info['scene_token']
@@ -354,10 +444,30 @@ class ELMDataset(VQADataset, __DisplMixin):
                 if value1 is None:
                     continue
 
-                if "BOX QA" in value1:
-                    BOX_q = value1['BOX QA']['q']
-                    BOX_a = value1['BOX QA']['a']
+                ####################### 
+                # if "BOX QA" in value1:
+                #     BOX_q = value1['BOX QA']['q']
+                #     BOX_a = value1['BOX QA']['a']
+                #     assert len(BOX_q) == len(BOX_a)
+                # if "History BOX QA" in value1:
+                #     BOX_q = value1['History BOX QA']['q']
+                #     BOX_a = value1['History BOX QA']['a']
+                #     assert len(BOX_q) == len(BOX_a)
+                # if "Future BOX QA" in value1:
+                #     BOX_q = value1['Future BOX QA']['q']
+                #     BOX_a = value1['Future BOX QA']['a']
+                #     assert len(BOX_q) == len(BOX_a)
+                # if "Planning" in value1:
+                #     BOX_q = value1['Planning']['q']
+                #     BOX_a = value1['Planning']['a']
+                #     assert len(BOX_q) == len(BOX_a)
+
+                if ann_type in value1:
+                    BOX_q = value1[ann_type]['q']
+                    BOX_a = value1[ann_type]['a']
                     assert len(BOX_q) == len(BOX_a)
+
+                #######################
                 else:
                     BOX_q = []
                     BOX_a = []
@@ -365,39 +475,101 @@ class ELMDataset(VQADataset, __DisplMixin):
                 Question = BOX_q
                 Answer = BOX_a
 
-            assert len(Question) == len(Answer)
+                assert len(Question) == len(Answer)
 
-            if self.first_img is None:
-                self.first_img = image_path
+                # if self.first_img is None:
+                #     self.first_img = image_path
 
-            for idx in range(len(Question)):
-                # reduce the decimals of questions
-                coor1, coor2 = Question[idx].split('<c, CAM_FRONT, ')[-1].split('>')[0].split(', ')
-                num1, num2 = round(float(coor1), 1), round(float(coor2), 1)
-                Question[idx] = Question[idx].replace(coor1, str(num1))
-                Question[idx] = Question[idx].replace(coor2, str(num2))
-                Question[idx] += ", then describe the class of this object."
+                for idx in range(len(Question)):
+                    # reduce the decimals of questions
+                    coor1, coor2 = Question[idx].split('<c, CAM_FRONT, ')[-1].split('>')[0].split(', ')
+                    num1, num2 = round(float(coor1), 1), round(float(coor2), 1)
+                    Question[idx] = Question[idx].replace(coor1, str(num1))
+                    Question[idx] = Question[idx].replace(coor2, str(num2))
+                    Question[idx] += ", then describe the class of this object."
 
-                x, y, z, label = Answer[idx].split(', ')
-                x = x.split('A: ')[-1]
-                index = round(float(x)) + self.num_threshold 
-                vocab_1 = self.num_to_vocab[index]
+                    x, y, z, label = Answer[idx].split(', ')
+                    x = x.split('A: ')[-1]
+                    index = round(float(x)) + self.num_threshold 
+                    vocab_1 = self.num_to_vocab[index]
 
-                index = round(float(y)) + self.num_threshold + 100 # !!!important!!!!!
-                vocab_2 = self.num_to_vocab[index]
+                    index = round(float(y)) + self.num_threshold + 100 # !!!important!!!!!
+                    vocab_2 = self.num_to_vocab[index]
 
-                index = round(float(z)) + self.num_threshold + 300
-                vocab_3 = self.num_to_vocab[index]
+                    index = round(float(z)) + self.num_threshold + 300
+                    vocab_3 = self.num_to_vocab[index]
 
-                vocab = [vocab_1, vocab_2, vocab_3]
-                strings = 'Location: '+' '.join(vocab) + ' Label: ' + label
+                    vocab = [vocab_1, vocab_2, vocab_3]
+                    strings = 'Location: '+' '.join(vocab) + ' Label: ' + label
 
-                self.questions.append(Question[idx])
-                self.answers.append([strings])
-                self.images.append(self.first_img)
-                self.tmp_imglist.append([self.first_img]*self.temporal_length)
+                    self.questions.append(Question[idx])
+                    self.answers.append([strings])
+                    self.answers.append([strings] + [round(float(x)), round(float(y)), round(float(z))])
+                    # self.images.append(self.first_img)
+                    # self.tmp_imglist.append([self.first_img]*self.temporal_length)
+                    self.images.append(image_path)
+                    # self.tmp_imglist.append(tmp_image)
+                    cur_tmp_image = tmp_image[1:] + [image_path]
+                    self.tmp_imglist.append(cur_tmp_image)
+
+
+    def default_boxqa_det_track_pred(self, ann_paths):
+        annotation_det_path = "data/box_detection_train.json"
+        annotation_track = "data/tracking_train.json"
+        annotation_pred = "data/box_prediction_train.json"
+
+        self.default_boxqa(annotation_det_path, "BOX QA", 7)
+        num_anno_det = len(self.questions)
+        print("Train: the number of data_det: ", num_anno_det)
+
+        self.default_boxqa(annotation_track, "History BOX QA", 7)
+
+        # all_track_00_sec_idx = []
+        # all_track_30_sec_idx = []
+        # all_track_35_sec_idx = []
+        # for cur_idx, cur_question in enumerate(self.questions):
+        #     if '3.5 seconds' in cur_question:
+        #         all_track_35_sec_idx.append(cur_idx)
+        #     if '3.0 seconds' in cur_question:
+        #         all_track_30_sec_idx.append(cur_idx)
+        #     if '0.0 seconds' in cur_question:
+        #         all_track_00_sec_idx.append(cur_idx)
+
+        num_anno_track = len(self.questions) - num_anno_det
+        print("Train: the number of data_track: ", num_anno_track)
+
+        self.default_boxqa(annotation_pred, "Future BOX QA", 7)
+        num_anno_pred = len(self.questions) - num_anno_det - num_anno_track
+        print("Train: the number of data_pred: ", num_anno_pred)
+
+
+        all_idx = []
+        for cur_idx, cur_tmp_imglist in enumerate(self.tmp_imglist):
+            if len(cur_tmp_imglist) != 7:
+                all_idx.append(cur_idx)
+
+        # sample labels
+        random_numbers = random.sample(range(0, len(self.questions) + 1), 90)
+        self.questions = [self.questions[select_num] for select_num in random_numbers]
+        self.answers = [self.answers[select_num] for select_num in random_numbers]
+        self.images = [self.images[select_num] for select_num in random_numbers]
+        self.tmp_imglist = [self.tmp_imglist[select_num] for select_num in random_numbers]
+
+        # all_pred_00_sec_idx = []
+        # all_pred_30_sec_idx = []
+        # all_pred_35_sec_idx = []
+        # for cur_idx, cur_question in enumerate(self.questions):
+        #     if '3.5 seconds' in cur_question:
+        #         all_pred_35_sec_idx.append(cur_idx)
+        #     if '3.0 seconds' in cur_question:
+        #         all_pred_30_sec_idx.append(cur_idx)
+        #     if '0.0 seconds' in cur_question:
+        #         all_pred_00_sec_idx.append(cur_idx)
+
 
     def __getitem__(self, index):
+        # index = 0
+
         image_path = self.images[index]
         tmp_imglist = self.tmp_imglist[index]
         image = Image.open(image_path).convert("RGB")
@@ -421,7 +593,9 @@ class ELMDataset(VQADataset, __DisplMixin):
         }
 
     def __len__(self):
-        return (len(self.questions)+len(self.questions))
+        # return (len(self.questions)+len(self.questions))
+        return len(self.questions)
+
 
     def collater(self, samples):
         # merge samples into a list for each key
@@ -453,6 +627,7 @@ class ELMDatasetEvalDataset(VQADataset, __DisplMixin):
         self.answers = []
         self.questions = []
         self.images = []
+        self.first_img = None
 
         self.vis_root = vis_root
         self.vis_processor = vis_processor
@@ -468,17 +643,72 @@ class ELMDatasetEvalDataset(VQADataset, __DisplMixin):
                     self.num_to_vocab[line_number] = line_content
 
 
-        self.default_drivelm(ann_paths)
+        # self.default_drivelm(ann_paths)
+        self.tmp_imglist = []
+        # self.temporal_length = 1
+        # self.default_boxqa(ann_paths)
+
+        # self.default_boxqa_det_track_pred(ann_paths)
+        self.configure_traffic()
+        self.default_traffic()
+        self.default_drivelm()
+
         print("The number of data: ", len(self.questions))
 
-        self.questions.extend(self.questions)
-        self.answers.extend(self.answers)
-        self.images.extend(self.images)
+        # self.questions.extend(self.questions)
+        # self.answers.extend(self.answers)
+        # self.images.extend(self.images)
 
 
-    def default_drivelm(self, ann_paths):
-        self.annotation = json.load(open(ann_paths[0], "r"))
+    # def default_drivelm(self, ann_paths):
+    def default_drivelm(self):
+        self.temporal_length = 6
+
+        # self.annotation = json.load(open(ann_paths[0], "r"))
+        # self.annotation = json.load(open('data/drivelm_val.json', "r"))
+
         self.data_info = pickle.load(open("data/nuscenes/bevdetv2-nuscenes_infos_val.pkl", "rb"))["infos"]
+        nuscenes_info_val_reformat = {}
+        annotation_drivelm_val = json.load(open('data/drivelm_v11_nus/v1_1_val_nus_q_only.json', "r"))
+        annotation_drivelm_val_reformat = {}
+
+        for cur_nuscenes_info in self.data_info:
+            if cur_nuscenes_info['scene_token'] not in nuscenes_info_val_reformat:
+                nuscenes_info_val_reformat[cur_nuscenes_info['scene_token']] = {}
+            if cur_nuscenes_info['token'] not in nuscenes_info_val_reformat[cur_nuscenes_info['scene_token']]:
+                nuscenes_info_val_reformat[cur_nuscenes_info['scene_token']][cur_nuscenes_info['token']] = {}
+            nuscenes_info_val_reformat[cur_nuscenes_info['scene_token']][cur_nuscenes_info['token']]['timestamp'] = str(cur_nuscenes_info['cams']['CAM_FRONT']['timestamp'])
+
+        for cur_key, cur_value in annotation_drivelm_val.items():
+            annotation_drivelm_val_reformat[cur_key] = {}
+            annotation_drivelm_val_reformat[cur_key]['key_frame'] = {}
+            for cur_key_frame_key, cur_key_frame_value in cur_value['key_frames'].items():
+                cur_timestamp = nuscenes_info_val_reformat[cur_key][cur_key_frame_key]['timestamp']
+                annotation_drivelm_val_reformat[cur_key]['key_frame'][cur_timestamp] = {}
+                annotation_drivelm_val_reformat[cur_key]['key_frame'][cur_timestamp]['Perception'] = {}
+                annotation_drivelm_val_reformat[cur_key]['key_frame'][cur_timestamp]['Prediction and Planning'] = {}
+                q_perception_list, a_perception_list, q_pred_list, a_pred_list, q_plan_list, a_plan_list = [], [], [], [], [], []
+                for cur_qa_perception in cur_key_frame_value['QA']['perception']:
+                    q_perception_list.append(cur_qa_perception['Q'])
+                    a_perception_list.append(cur_qa_perception['A'])
+                for cur_qa_pred in cur_key_frame_value['QA']['prediction']:
+                    q_pred_list.append(cur_qa_pred['Q'])
+                    a_pred_list.append(cur_qa_pred['A'])
+                for cur_qa_plan in cur_key_frame_value['QA']['planning']:
+                    q_plan_list.append(cur_qa_plan['Q'])
+                    a_plan_list.append(cur_qa_plan['A'])
+
+                q_pred_plan_list = q_pred_list + q_plan_list
+                a_pred_plan_list = a_pred_list + a_plan_list
+
+                annotation_drivelm_val_reformat[cur_key]['key_frame'][cur_timestamp]['Perception']['q'] = q_perception_list
+                annotation_drivelm_val_reformat[cur_key]['key_frame'][cur_timestamp]['Perception']['a'] = a_perception_list
+                annotation_drivelm_val_reformat[cur_key]['key_frame'][cur_timestamp]['Prediction and Planning']['q'] = q_pred_plan_list
+                annotation_drivelm_val_reformat[cur_key]['key_frame'][cur_timestamp]['Prediction and Planning']['a'] = a_pred_plan_list
+
+        self.annotation = annotation_drivelm_val_reformat
+
+        # self.data_info = pickle.load(open("data/nuscenes/bevdetv2-nuscenes_infos_val.pkl", "rb"))["infos"]
         for idx, info in enumerate(self.data_info):
             scene_token = info['scene_token']
             timestamp = info['cams']['CAM_FRONT']['timestamp']
@@ -491,6 +721,23 @@ class ELMDatasetEvalDataset(VQADataset, __DisplMixin):
             scene_key_frame = value['key_frame']
             frame_id = str(timestamp)
             if frame_id in scene_key_frame:
+                # temporal data only for image path
+                tmp_image = []
+                for tmp in range(1, self.temporal_length+1):
+                    if scene_token != self.data_info[idx-tmp]['scene_token']:
+                        continue
+                    tmp_path = self.data_info[idx-tmp]['cams']['CAM_FRONT']['data_path']
+                    tmp_image.append(tmp_path)
+
+                # if the image path is not equal self.temporal length, then use the duplicate image path
+                tmp_image = tmp_image[::-1]
+                if len(tmp_image) != self.temporal_length:
+                    if len(tmp_image) != 0:
+                        tmp_image = tmp_image[:1] * (self.temporal_length - len(tmp_image)) + tmp_image
+                    else:
+                        tmp_image = [image_path] * self.temporal_length
+                assert len(tmp_image) == self.temporal_length
+
                 value1 = scene_key_frame[frame_id]
 
                 if "Perception" in value1:
@@ -512,13 +759,14 @@ class ELMDatasetEvalDataset(VQADataset, __DisplMixin):
                 Answer = Perception_a + Prediction_a
 
             
-            assert len(Question) == len(Answer)
+                assert len(Question) == len(Answer)
 
-            for idx in range(len(Question)):                
-                self.questions.append(Question[idx])
-                self.answers.append([Answer[idx]])
-                self.images.append(image_path)
-
+                for idx in range(len(Question)):                
+                    self.questions.append(Question[idx])
+                    self.answers.append([Answer[idx]])
+                    self.images.append(image_path)
+                    cur_tmp_image = tmp_image + [image_path]
+                    self.tmp_imglist.append(cur_tmp_image)
 
 
     def default_ego4d(self):
@@ -574,8 +822,20 @@ class ELMDatasetEvalDataset(VQADataset, __DisplMixin):
                         self.answers.append([narration['narration_text'][3:]])
                         self.images.append(img_path)
 
-    def default_boxqa(self, ann_paths):
-        self.annotation = json.load(open("data/box_detection_val.json", "r"))
+    def default_boxqa(self, ann_paths, ann_type, temporal_length):
+        # self.annotation = json.load(open("data/box_detection_val.json", "r"))
+        # self.annotation = json.load(open("data/tracking_val.json", "r"))
+        # self.annotation = json.load(open("data/box_prediction_val.json", "r"))
+        # self.annotation = json.load(open("data/planning_val.json", "r"))
+
+        self.annotation = json.load(open(ann_paths, "r"))
+
+        # first_key, first_value = next(iter(self.annotation.items()))
+        # self.annotation = {}
+        # self.annotation[first_key] = first_value
+
+        self.temporal_length = temporal_length
+        
         self.data_info = pickle.load(open("data/nuscenes/bevdetv2-nuscenes_infos_trainval.pkl", "rb"))["infos"]
         for idx, info in enumerate(self.data_info):
             scene_token = info['scene_token']
@@ -612,9 +872,27 @@ class ELMDatasetEvalDataset(VQADataset, __DisplMixin):
                 if value1 is None:
                     continue
 
-                if "BOX QA" in value1:
-                    BOX_q = value1['BOX QA']['q']
-                    BOX_a = value1['BOX QA']['a']
+                ####################### 
+                # if "BOX QA" in value1:
+                #     BOX_q = value1['BOX QA']['q']
+                #     BOX_a = value1['BOX QA']['a']
+                #     assert len(BOX_q) == len(BOX_a)
+                # if "History BOX QA" in value1:
+                #     BOX_q = value1['History BOX QA']['q']
+                #     BOX_a = value1['History BOX QA']['a']
+                #     assert len(BOX_q) == len(BOX_a)
+                # if "Future BOX QA" in value1:
+                #     BOX_q = value1['Future BOX QA']['q']
+                #     BOX_a = value1['Future BOX QA']['a']
+                #     assert len(BOX_q) == len(BOX_a)
+                # if "Planning" in value1:
+                #     BOX_q = value1['Planning']['q']
+                #     BOX_a = value1['Planning']['a']
+                #     assert len(BOX_q) == len(BOX_a)
+                #######################
+                if ann_type in value1:
+                    BOX_q = value1[ann_type]['q']
+                    BOX_a = value1[ann_type]['a']
                     assert len(BOX_q) == len(BOX_a)
                 else:
                     BOX_q = []
@@ -623,38 +901,41 @@ class ELMDatasetEvalDataset(VQADataset, __DisplMixin):
                 Question = BOX_q
                 Answer = BOX_a
 
-            assert len(Question) == len(Answer)
+                assert len(Question) == len(Answer)
 
-            if self.first_img is None:
-                self.first_img = image_path
-                
-            for idx in range(len(Question)):
-                # reduce the decimals of questions
-                coor1, coor2 = Question[idx].split('<c, CAM_FRONT, ')[-1].split('>')[0].split(', ')
-                num1, num2 = round(float(coor1), 1), round(float(coor2), 1)
-                Question[idx] = Question[idx].replace(coor1, str(num1))
-                Question[idx] = Question[idx].replace(coor2, str(num2))
-                Question[idx] += ", then describe the class of this object."
+                # if self.first_img is None:
+                #     self.first_img = image_path
+                    
+                for idx in range(len(Question)):
+                    # reduce the decimals of questions
+                    coor1, coor2 = Question[idx].split('<c, CAM_FRONT, ')[-1].split('>')[0].split(', ')
+                    num1, num2 = round(float(coor1), 1), round(float(coor2), 1)
+                    Question[idx] = Question[idx].replace(coor1, str(num1))
+                    Question[idx] = Question[idx].replace(coor2, str(num2))
+                    Question[idx] += ", then describe the class of this object."
 
-                x, y, z, label = Answer[idx].split(', ')
-                x = x.split('A: ')[-1]
-                index = round(float(x)) + self.num_threshold 
-                vocab_1 = self.num_to_vocab[index]
+                    x, y, z, label = Answer[idx].split(', ')
+                    x = x.split('A: ')[-1]
+                    index = round(float(x)) + self.num_threshold 
+                    vocab_1 = self.num_to_vocab[index]
 
-                index = round(float(y)) + self.num_threshold + 100 # !!!important!!!!!
-                vocab_2 = self.num_to_vocab[index]
+                    index = round(float(y)) + self.num_threshold + 100 # !!!important!!!!!
+                    vocab_2 = self.num_to_vocab[index]
 
-                index = round(float(z)) + self.num_threshold + 300
-                vocab_3 = self.num_to_vocab[index]
+                    index = round(float(z)) + self.num_threshold + 300
+                    vocab_3 = self.num_to_vocab[index]
 
-                vocab = [vocab_1, vocab_2, vocab_3]
-                strings = 'Location: '+' '.join(vocab) + ' Label: ' + label
+                    vocab = [vocab_1, vocab_2, vocab_3]
+                    strings = 'Location: '+' '.join(vocab) + ' Label: ' + label
 
-                self.questions.append(Question[idx])
-                self.answers.append([strings])
-                self.images.append(self.first_img)
-                self.tmp_imglist.append([self.first_img]*self.temporal_length)
-
+                    self.questions.append(Question[idx])
+                    self.answers.append([strings])
+                    # self.images.append(self.first_img)
+                    # self.tmp_imglist.append([self.first_img]*self.temporal_length)
+                    self.images.append(image_path)
+                    # self.tmp_imglist.append(tmp_image)
+                    cur_tmp_image = tmp_image[1:] + [image_path]
+                    self.tmp_imglist.append(cur_tmp_image)
 
     def configure_traffic(self):
         data_root = 'data/openlane_v2_nus'
@@ -662,9 +943,17 @@ class ELMDatasetEvalDataset(VQADataset, __DisplMixin):
             data_infos = pickle.load(f)
         
         data_infos = list(data_infos.values())
+        
+        # data_infos = random.sample(data_infos, 20)
+
+        nuscenes_info = pickle.load(open("data/nuscenes/bevdetv2-nuscenes_infos_train.pkl", "rb"))["infos"]
+        self.traffic_element_dict = {}
+        for cur_nuscenes_info in nuscenes_info:
+            self.traffic_element_dict[cur_nuscenes_info['scene_token']] = {}
+
         num=0
         
-        for info in tqdm(data_infos):
+        for info in tqdm.tqdm(data_infos):
             ann_info = info['annotation']
             timestamp = info['timestamp']
             scene_id = info['meta_data']['source_id']
@@ -693,8 +982,25 @@ class ELMDatasetEvalDataset(VQADataset, __DisplMixin):
 
 
     def default_traffic(self):
-        self.data_info = pickle.load(open("data/nuscenes/bevdetv2-nuscenes_infos_trainval.pkl", "rb"))["infos"]
+        self.te_convert = {
+            0:  'unknown',
+            1:  'red',
+            2:  'green',
+            3:  'yellow',
+            4:  'go_straight',
+            5:  'turn_left',
+            6:  'turn_right',
+            7:  'no_left_turn',
+            8:  'no_right_turn',
+            9:  'u_turn',
+            10: 'no_u_turn',
+            11: 'slight_left',
+            12: 'slight_right',
+        }
 
+        self.temporal_length = 6
+        self.data_info = pickle.load(open("data/nuscenes/bevdetv2-nuscenes_infos_trainval.pkl", "rb"))["infos"]
+        
         neg_num = 0
         pos_num = 0
         for idx, info in enumerate(self.data_info):
@@ -775,22 +1081,80 @@ class ELMDatasetEvalDataset(VQADataset, __DisplMixin):
                 if length==15:
                     Traffic_a = f'Yes. The ego vehicle has seen {element_counts[longest_list[0]]} {self.te_convert[longest_list[0]]}, {element_counts[longest_list[1]]} {self.te_convert[longest_list[1]]}, {element_counts[longest_list[2]]} {self.te_convert[longest_list[2]]}, {element_counts[longest_list[3]]} {self.te_convert[longest_list[3]]}, {element_counts[longest_list[4]]} {self.te_convert[longest_list[4]]}, {element_counts[longest_list[5]]} {self.te_convert[longest_list[5]]}, {element_counts[longest_list[6]]} {self.te_convert[longest_list[6]]}, {element_counts[longest_list[7]]} {self.te_convert[longest_list[7]]}, {element_counts[longest_list[8]]} {self.te_convert[longest_list[8]]}, {element_counts[longest_list[9]]} {self.te_convert[longest_list[9]]}, {element_counts[longest_list[10]]} {self.te_convert[longest_list[10]]}, {element_counts[longest_list[11]]} {self.te_convert[longest_list[11]]}, {element_counts[longest_list[12]]} {self.te_convert[longest_list[12]]}, {element_counts[longest_list[13]]} {self.te_convert[longest_list[13]]} and {element_counts[longest_list[14]]} {self.te_convert[longest_list[14]]} before.'
 
-            if (length == 0 and idx % 3 == 0) or (length != 0):
-                if length == 0:
-                    neg_num += 1
-                else:
-                    pos_num += 1
-                self.images.append(image_path)
-                self.tmp_imglist.append(tmp_image)
-                self.questions.append(Traffic_q)
-                self.answers.append([Traffic_a])
+                if (length == 0 and idx % 3 == 0) or (length != 0):
+                    if length == 0:
+                        neg_num += 1
+                    else:
+                        pos_num += 1
+                    self.images.append(image_path)
+                    cur_tmp_image = tmp_image + [image_path]
+                    self.tmp_imglist.append(cur_tmp_image)
+                    self.questions.append(Traffic_q)
+                    self.answers.append([Traffic_a])
         
         print("The number of traffic questions: ", len(self.questions))
         print("The number of positive questions: ", pos_num)
         print("The number of negative questions: ", neg_num)
 
 
+    def default_boxqa_det_track_pred(self, ann_paths):
+        annotation_det_path = "data/box_detection_val.json"
+        annotation_track = "data/tracking_val.json"
+        annotation_pred = "data/box_prediction_val.json"
+
+        self.default_boxqa(annotation_det_path, "BOX QA", 7)
+        num_anno_det = len(self.questions)
+        print("Val: the number of data_det: ", num_anno_det)
+
+        self.default_boxqa(annotation_track, "History BOX QA", 7)
+        
+        # all_track_00_sec_idx = []
+        # all_track_30_sec_idx = []
+        # all_track_35_sec_idx = []
+        # for cur_idx, cur_question in enumerate(self.questions):
+        #     if '3.5 seconds' in cur_question:
+        #         all_track_35_sec_idx.append(cur_idx)
+        #     if '3.0 seconds' in cur_question:
+        #         all_track_30_sec_idx.append(cur_idx)
+        #     if '0.0 seconds' in cur_question:
+        #         all_track_00_sec_idx.append(cur_idx)
+        
+        num_anno_track = len(self.questions) - num_anno_det
+        print("Val: the number of data_track: ", num_anno_track)
+        
+        self.default_boxqa(annotation_pred, "Future BOX QA", 7)
+
+        # all_pred_00_sec_idx = []
+        # all_pred_30_sec_idx = []
+        # all_pred_35_sec_idx = []
+        # for cur_idx, cur_question in enumerate(self.questions):
+        #     if '3.5 seconds' in cur_question:
+        #         all_pred_35_sec_idx.append(cur_idx)
+        #     if '3.0 seconds' in cur_question:
+        #         all_pred_30_sec_idx.append(cur_idx)
+        #     if '0.0 seconds' in cur_question:
+        #         all_pred_00_sec_idx.append(cur_idx)
+
+        num_anno_pred = len(self.questions) - num_anno_det - num_anno_track
+        print("Val: the number of data_pred: ", num_anno_pred)
+
+        # all_idx = []
+        # for cur_idx, cur_tmp_imglist in enumerate(self.tmp_imglist):
+        #     if len(cur_tmp_imglist) != 7:
+        #         all_idx.append(cur_idx)
+
+        # sample labels
+        # random_numbers = random.sample(range(0, len(self.questions) + 1), 20)
+        # self.questions = [self.questions[select_num] for select_num in random_numbers]
+        # self.answers = [self.answers[select_num] for select_num in random_numbers]
+        # self.images = [self.images[select_num] for select_num in random_numbers]
+        # self.tmp_imglist = [self.tmp_imglist[select_num] for select_num in random_numbers]
+
+
     def __getitem__(self, index):
+        # print("Index: ", index)
+        # print("Num samples: ", len(self.questions))
+
         image_path = self.images[index]
         tmp_imglist = self.tmp_imglist[index]
         image = Image.open(image_path).convert("RGB")

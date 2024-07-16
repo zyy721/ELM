@@ -630,7 +630,10 @@ class RunnerBase:
             )
             checkpoint = torch.load(cached_file, map_location=self.device)
         elif os.path.isfile(url_or_filename):
-            checkpoint = torch.load(url_or_filename, map_location=self.device)
+            # checkpoint = torch.load(url_or_filename, map_location=self.device)
+
+            checkpoint = torch.load(url_or_filename, map_location='cpu')
+
         else:
             raise RuntimeError("checkpoint url or path is invalid")
 

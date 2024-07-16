@@ -13,6 +13,7 @@ model:
   max_txt_len: 320
 
   image_size: 364
+  pretrained: pretrained-models/blip2_pretrained_flant5xl.pth
 
 datasets:
   elm: # name of the dataset builder coco_vqa
@@ -35,10 +36,13 @@ datasets:
         annotations:
           train:
             storage: 'data/drivelm/train.json'
+            url: None
           test:
             storage: 'data/drivelm/val.json'
+            url: None
           val:
             storage: 'data/drivelm/val.json'
+            url: None
 
 run:
   task: 3d_vqa
@@ -49,12 +53,16 @@ run:
   warmup_lr: 1e-8
   warmup_steps: 1000
   weight_decay: 0.05
-  max_epoch: 100
-  batch_size_train: 6
+  # max_epoch: 100
+  max_epoch: 6
+  # batch_size_train: 6
+  batch_size_train: 10
   batch_size_eval: 8
   num_workers: 4 # 4
-  accum_grad_iters: 1
+  # accum_grad_iters: 1
+  accum_grad_iters: 2
   resume_ckpt_path: null
+  # resume_ckpt_path: "lavis/output/BLIP2/combine/20240709173/checkpoint_0.pth"
 
   max_len: 30 # 10
   min_len: 1
@@ -74,6 +82,8 @@ run:
   test_splits: ["test"]
 
   device: "cuda"
-  world_size: 64
-  dist_url: "env://"
+  # world_size: 64
+  world_size: 60
+  # dist_url: "env://"
+  dist_url: "env://127.0.0.1:23456"
   distributed: True
