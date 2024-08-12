@@ -17,6 +17,8 @@ model:
 
 datasets:
   elm: # name of the dataset builder coco_vqa
+  # elm_test: # name of the dataset builder coco_vqa
+
     vis_processor:
         train:
           name: "blip2_image_train"
@@ -51,20 +53,24 @@ run:
   init_lr: 1e-5
   min_lr: 1e-5
   warmup_lr: 1e-8
-  warmup_steps: 1000
+  warmup_steps: 100
   weight_decay: 0.05
   # max_epoch: 100
-  max_epoch: 6
+  max_epoch: 100
   # batch_size_train: 6
   batch_size_train: 2
-  batch_size_eval: 8
+  batch_size_eval: 2
   num_workers: 4 # 4
   # accum_grad_iters: 1
-  accum_grad_iters: 2
+  accum_grad_iters: 4
   resume_ckpt_path: null
-  # resume_ckpt_path: "lavis/output/BLIP2/combine/20240709173/checkpoint_0.pth"
+  # resume_ckpt_path: "pretrained-models/elm_checkpoint_pretrain.pth"
+  # resume_ckpt_path: "lavis/output/BLIP2/combine/20240801164/checkpoint_0.pth"
+  # resume_ckpt_path: "lavis/output/BLIP2/combine/20240801173/checkpoint_18.pth"
+  # resume_ckpt_path: "lavis/output/BLIP2/combine/20240802112/checkpoint_14.pth"
 
-  max_len: 30 # 10
+  # max_len: 30 # 10
+  max_len: 512 # 10
   min_len: 1
   num_beams: 5
  
@@ -77,13 +83,14 @@ run:
   # resume_ckpt_path: lavis/output/{checkpoint}
 
   evaluate: False
+  # evaluate: True
   train_splits: ["train"]
   valid_splits: ["val"]
   test_splits: ["test"]
 
   device: "cuda"
   # world_size: 64
-  world_size: 60
+  world_size: 4
   # dist_url: "env://"
   dist_url: "env://127.0.0.1:23456"
   distributed: True

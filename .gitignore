@@ -2,3 +2,6 @@ __pycache__
 lavis/output
 data
 pretrained-models
+bert-base-uncased
+flan-t5-xl
+aokvqa

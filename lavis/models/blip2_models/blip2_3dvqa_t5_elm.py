@@ -45,6 +45,7 @@ class Blip2VQAT5ELM(Blip2Base):
         prompt="",
         max_txt_len=32,
         apply_lemmatizer=False,
+
     ):
         """
         apply_lemmatizer: when set to True, postprocess predict_answers() result with lemmas.
@@ -70,12 +71,17 @@ class Blip2VQAT5ELM(Blip2Base):
             layer.output = None
             layer.intermediate = None
               
-        self.t5_tokenizer = T5TokenizerFast.from_pretrained(t5_model)
+        # self.t5_tokenizer = T5TokenizerFast.from_pretrained(t5_model)
+        self.t5_tokenizer = T5TokenizerFast.from_pretrained('./flan-t5-xl', local_files_only=True)
+
         self.origin_length = len(self.t5_tokenizer)
 
-        t5_config = T5Config.from_pretrained(t5_model)
+        # t5_config = T5Config.from_pretrained(t5_model)
+        t5_config = T5Config.from_pretrained('./flan-t5-xl', local_files_only=True)
+    
         t5_config.dense_act_fn = "gelu"
-        self.t5_model = T5ForConditionalGeneration.from_pretrained(t5_model, config=t5_config)
+        # self.t5_model = T5ForConditionalGeneration.from_pretrained(t5_model, config=t5_config)
+        self.t5_model = T5ForConditionalGeneration.from_pretrained('./flan-t5-xl', local_files_only=True, config=t5_config)
 
         self.t5_model.resize_token_embeddings(len(self.t5_tokenizer))
 
@@ -139,6 +145,10 @@ class Blip2VQAT5ELM(Blip2Base):
             self.check = False
         device = samples["vfeats"].device
         vfeats = samples["vfeats"]
+
+        #########################
+        vfeats = vfeats.squeeze(1)
+        #########################
 
         B = vfeats.shape[0]
         device = vfeats.device
@@ -364,6 +374,10 @@ class Blip2VQAT5ELM(Blip2Base):
             
         device = samples["vfeats"].device
         vfeats = samples["vfeats"]
+
+        ##########################
+        vfeats = vfeats.squeeze(1)
+        ##########################
 
         B = vfeats.shape[0]
         device = vfeats.device

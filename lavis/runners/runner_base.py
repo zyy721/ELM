@@ -90,6 +90,7 @@ class RunnerBase:
                 if self._wrapped_model is None:
                     self._wrapped_model = DDP(
                         self._model, device_ids=[self.config.run_cfg.gpu]
+                        # self._model, device_ids=[self.config.run_cfg.gpu], find_unused_parameters=True
                     )
             else:
                 self._wrapped_model = self._model
@@ -406,6 +407,7 @@ class RunnerBase:
 
                     val_log = self.eval_epoch(split_name=split_name, cur_epoch=cur_epoch)
 
+            # if cur_epoch % 4 == 0:
             self._save_checkpoint(cur_epoch, is_best=False)
 
             if self.evaluate_only:
@@ -414,8 +416,8 @@ class RunnerBase:
             dist.barrier()
 
         # testing phase
-        test_epoch = "best" if len(self.valid_splits) > 0 else cur_epoch
-        self.evaluate(cur_epoch=test_epoch, skip_reload=self.evaluate_only)
+        # test_epoch = "best" if len(self.valid_splits) > 0 else cur_epoch
+        # self.evaluate(cur_epoch=test_epoch, skip_reload=self.evaluate_only)
 
         total_time = time.time() - start_time
         total_time_str = str(datetime.timedelta(seconds=int(total_time)))
@@ -642,11 +644,25 @@ class RunnerBase:
         # for k in list(state_dict.keys()):
         #     state_dict["base_model.model." + k] = state_dict.pop(k)
 
+        for k in list(state_dict.keys()):
+            if 'base_model.model.t5_model.encoder.block' in k and 'SelfAttention.q.weight' in k or \
+               'base_model.model.t5_model.encoder.block' in k and 'SelfAttention.v.weight' in k or \
+               'base_model.model.t5_model.decoder.block' in k and 'SelfAttention.q.weight' in k or \
+               'base_model.model.t5_model.decoder.block' in k and 'SelfAttention.v.weight' in k or \
+               'base_model.model.t5_model.decoder.block' in k and 'EncDecAttention.q.weight' in k or \
+               'base_model.model.t5_model.decoder.block' in k and 'EncDecAttention.v.weight' in k:
+
+                # print(k)
+
+                k_w_base_model = k.replace('weight', 'base_layer.weight')
+                state_dict[k_w_base_model] = state_dict.pop(k)
+
         # state_dict.pop("t5_model.shared.weight")
         # state_dict.pop("t5_model.encoder.embed_tokens.weight")
         # state_dict.pop("t5_model.decoder.embed_tokens.weight")
         # state_dict.pop("t5_model.lm_head.weight")
-        self.unwrap_dist_model(self.model).load_state_dict(state_dict, strict=True)
+        # self.unwrap_dist_model(self.model).load_state_dict(state_dict, strict=True)
+        self.unwrap_dist_model(self.model).load_state_dict(state_dict, strict=False)
 
         try: 
             self.optimizer.load_state_dict(checkpoint["optimizer"])

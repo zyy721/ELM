@@ -1,4 +1,4 @@
-CONFIG=lavis/projects/blip2/train/advqa_t5_elm_vqgan.yaml
+CONFIG=lavis/projects/blip2/train/advqa_t5_elm_codalm.yaml
 
 python -m torch.distributed.run \
     --nproc_per_node=2 \

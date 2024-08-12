@@ -69,7 +69,7 @@ def get_img_frames(clip_id, timestamp_frame):
     return None
 
 
-class ELMDataset(VQADataset, __DisplMixin):
+class ELMDatasetVQGAN(VQADataset, __DisplMixin):
     def __init__(self, vis_processor=None, text_processor=None, vis_root=None, ann_paths=None):
         """
         vis_root (string): Root directory of images (e.g. coco/images/)
@@ -101,11 +101,11 @@ class ELMDataset(VQADataset, __DisplMixin):
         # self.default_boxqa_det_track_pred(ann_paths)
         # self.configure_traffic()
         # self.default_traffic()
-        self.default_drivelm()
-        # self.default_nuscenes_reconstruct()
+        # self.default_drivelm()
+        self.default_nuscenes_reconstruct()
         # self.default_codalm()
 
-        # self.data_images = ImagePaths(paths=self.images, size=256, random_crop=False)
+        self.data_images = ImagePaths(paths=self.images, size=256, random_crop=False)
 
         # print("The number of data: ", len(self.questions))
         print("The number of data: ", len(self.tmp_imglist))
@@ -646,17 +646,17 @@ class ELMDataset(VQADataset, __DisplMixin):
     def __getitem__(self, index):
         # index = 0
 
-        image_path = self.images[index]
-        tmp_imglist = self.tmp_imglist[index]
-        image = Image.open(image_path).convert("RGB")
-        image = self.vis_processor(image)
-        question = self.questions[index]
-        question = self.text_processor(question)
-        answer = self.answers[index]
-
-        # image = self.data_images[index]
-        # image = torch.as_tensor(image['image'])
+        # image_path = self.images[index]
         # tmp_imglist = self.tmp_imglist[index]
+        # image = Image.open(image_path).convert("RGB")
+        # image = self.vis_processor(image)
+        # question = self.questions[index]
+        # question = self.text_processor(question)
+        # answer = self.answers[index]
+
+        image = self.data_images[index]
+        image = torch.as_tensor(image['image'])
+        tmp_imglist = self.tmp_imglist[index]
         # question = self.questions[index]
         # question = self.text_processor(question)
         # answer = self.answers[index]   
@@ -669,8 +669,8 @@ class ELMDataset(VQADataset, __DisplMixin):
         tmp_image = torch.stack(tmp_image, dim=0)
         
         return {
-            "question": question,
-            "answer": answer,
+            # "question": question,
+            # "answer": answer,
             "image": image,
             "tmp_image": tmp_image,
         }
@@ -681,46 +681,46 @@ class ELMDataset(VQADataset, __DisplMixin):
         return len(self.tmp_imglist)
 
 
-    def collater(self, samples):
-        # merge samples into a list for each key
-        questions = [s["question"] for s in samples]
-        answers = [s["answer"] for s in samples]
-        images = [s["image"] for s in samples]
-        tmp_images = [s["tmp_image"] for s in samples]
-
-        images = torch.stack(images, dim=0)
-        tmp_images = torch.stack(tmp_images, dim=0)
-        # [][][] -> []
-        answers = [item[0] for item in answers]
-
-        return {
-            "images": images,
-            "questions": questions,
-            "answers": answers,
-            "vfeats": tmp_images,
-        }
-
     # def collater(self, samples):
     #     # merge samples into a list for each key
-    #     # questions = [s["question"] for s in samples]
-    #     # answers = [s["answer"] for s in samples]
+    #     questions = [s["question"] for s in samples]
+    #     answers = [s["answer"] for s in samples]
     #     images = [s["image"] for s in samples]
     #     tmp_images = [s["tmp_image"] for s in samples]
 
     #     images = torch.stack(images, dim=0)
     #     tmp_images = torch.stack(tmp_images, dim=0)
     #     # [][][] -> []
-    #     # answers = [item[0] for item in answers]
+    #     answers = [item[0] for item in answers]
 
     #     return {
     #         "images": images,
-    #         # "questions": questions,
-    #         # "answers": answers,
+    #         "questions": questions,
+    #         "answers": answers,
     #         "vfeats": tmp_images,
     #     }
 
+    def collater(self, samples):
+        # merge samples into a list for each key
+        # questions = [s["question"] for s in samples]
+        # answers = [s["answer"] for s in samples]
+        images = [s["image"] for s in samples]
+        tmp_images = [s["tmp_image"] for s in samples]
 
-class ELMDatasetEvalDataset(VQADataset, __DisplMixin):
+        images = torch.stack(images, dim=0)
+        tmp_images = torch.stack(tmp_images, dim=0)
+        # [][][] -> []
+        # answers = [item[0] for item in answers]
+
+        return {
+            "images": images,
+            # "questions": questions,
+            # "answers": answers,
+            "vfeats": tmp_images,
+        }
+
+
+class ELMDatasetEvalDatasetVQGAN(VQADataset, __DisplMixin):
     def __init__(self, vis_processor=None, text_processor=None, vis_root=None, ann_paths=None):
         """
         vis_root (string): Root directory of images (e.g. coco/images/)
@@ -753,11 +753,11 @@ class ELMDatasetEvalDataset(VQADataset, __DisplMixin):
         # self.default_boxqa_det_track_pred(ann_paths)
         # self.configure_traffic()
         # self.default_traffic()
-        self.default_drivelm()
-        # self.default_nuscenes_reconstruct()
+        # self.default_drivelm()
+        self.default_nuscenes_reconstruct()
         # self.default_codalm()
 
-        # self.data_images = ImagePaths(paths=self.images, size=256, random_crop=False)
+        self.data_images = ImagePaths(paths=self.images, size=256, random_crop=False)
 
         # print("The number of data: ", len(self.questions))
         print("The number of data: ", len(self.tmp_imglist))
@@ -1318,18 +1318,19 @@ class ELMDatasetEvalDataset(VQADataset, __DisplMixin):
 
     def __getitem__(self, index):
         # index = 0
+        index = random.randint(0, len(self.data_images))
 
-        image_path = self.images[index]
-        tmp_imglist = self.tmp_imglist[index]
-        image = Image.open(image_path).convert("RGB")
-        image = self.vis_processor(image)
-        question = self.questions[index]
-        question = self.text_processor(question)
-        answer = self.answers[index]
-
-        # image = self.data_images[index]
-        # image = torch.as_tensor(image['image'])
+        # image_path = self.images[index]
         # tmp_imglist = self.tmp_imglist[index]
+        # image = Image.open(image_path).convert("RGB")
+        # image = self.vis_processor(image)
+        # question = self.questions[index]
+        # question = self.text_processor(question)
+        # answer = self.answers[index]
+
+        image = self.data_images[index]
+        image = torch.as_tensor(image['image'])
+        tmp_imglist = self.tmp_imglist[index]
         # question = self.questions[index]
         # question = self.text_processor(question)
         # answer = self.answers[index]   
@@ -1342,50 +1343,56 @@ class ELMDatasetEvalDataset(VQADataset, __DisplMixin):
         tmp_image = torch.stack(tmp_image, dim=0)
         
         return {
-            "question": question,
-            "answer": answer,
+            # "question": question,
+            # "answer": answer,
             "image": image,
             "tmp_image": tmp_image,
+            "path_image": tmp_imglist,
+
         }
 
     def __len__(self):
         # return len(self.questions)
         return len(self.tmp_imglist)
 
-    def collater(self, samples):
-        # merge samples into a list for each key
-        questions = [s["question"] for s in samples]
-        answers = [s["answer"] for s in samples]
-        images = [s["image"] for s in samples]
-        tmp_images = [s["tmp_image"] for s in samples]
-
-        images = torch.stack(images, dim=0)
-        tmp_images = torch.stack(tmp_images, dim=0)
-        # [][][] -> []
-        answers = [item[0] for item in answers]
-
-        return {
-            "images": images,
-            "questions": questions,
-            "answers": answers,
-            "vfeats": tmp_images,
-        }
-
     # def collater(self, samples):
     #     # merge samples into a list for each key
-    #     # questions = [s["question"] for s in samples]
-    #     # answers = [s["answer"] for s in samples]
+    #     questions = [s["question"] for s in samples]
+    #     answers = [s["answer"] for s in samples]
     #     images = [s["image"] for s in samples]
     #     tmp_images = [s["tmp_image"] for s in samples]
 
     #     images = torch.stack(images, dim=0)
     #     tmp_images = torch.stack(tmp_images, dim=0)
     #     # [][][] -> []
-    #     # answers = [item[0] for item in answers]
+    #     answers = [item[0] for item in answers]
 
     #     return {
     #         "images": images,
-    #         # "questions": questions,
-    #         # "answers": answers,
+    #         "questions": questions,
+    #         "answers": answers,
     #         "vfeats": tmp_images,
     #     }
+
+    def collater(self, samples):
+        # merge samples into a list for each key
+        # questions = [s["question"] for s in samples]
+        # answers = [s["answer"] for s in samples]
+        images = [s["image"] for s in samples]
+        tmp_images = [s["tmp_image"] for s in samples]
+
+        images = torch.stack(images, dim=0)
+        tmp_images = torch.stack(tmp_images, dim=0)
+        # [][][] -> []
+        # answers = [item[0] for item in answers]
+
+        path_images = [s["path_image"] for s in samples]
+
+        return {
+            "images": images,
+            # "questions": questions,
+            # "answers": answers,
+            "vfeats": tmp_images,
+            "path_images": path_images,
+
+        }

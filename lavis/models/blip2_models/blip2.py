@@ -47,6 +47,32 @@ class Blip2Base(BaseModel):
             return contextlib.nullcontext()
 
     @classmethod
+    def init_Qformer_vqgan(cls, num_query_token, vision_width, cross_attention_freq=2):
+        # encoder_config = BertConfig.from_pretrained("bert-base-uncased")
+        encoder_config = BertConfig.from_pretrained("./bert-base-uncased", local_files_only=True)
+
+        encoder_config.encoder_width = vision_width
+        # insert cross-attention layer every other block
+        encoder_config.add_cross_attention = True
+        encoder_config.cross_attention_freq = cross_attention_freq
+        encoder_config.query_length = num_query_token
+        # Qformer = BertLMHeadModel.from_pretrained("bert-base-uncased", config=encoder_config)
+        Qformer = BertLMHeadModel.from_pretrained("./bert-base-uncased", config=encoder_config, local_files_only=True)
+
+        # query_tokens = nn.Parameter(torch.zeros(1, num_query_token, encoder_config.hidden_size))
+        # extra_query_tokens = nn.Parameter(torch.zeros(1, (128 - num_query_token), encoder_config.hidden_size))
+        # query_tokens.data.normal_(mean=0.0, std=encoder_config.initializer_range)
+        # extra_query_tokens.data.normal_(mean=0.0, std=encoder_config.initializer_range)
+        # return Qformer, query_tokens, extra_query_tokens
+
+        query_tokens = nn.Parameter(torch.zeros(1, num_query_token, encoder_config.hidden_size))
+        # extra_query_tokens = nn.Parameter(torch.zeros(1, (128 - num_query_token), encoder_config.hidden_size))
+        query_tokens.data.normal_(mean=0.0, std=encoder_config.initializer_range)
+        # extra_query_tokens.data.normal_(mean=0.0, std=encoder_config.initializer_range)
+        # return Qformer, query_tokens, extra_query_tokens
+        return Qformer, query_tokens
+
+    @classmethod
     def init_Qformer(cls, num_query_token, vision_width, cross_attention_freq=2):
         # encoder_config = BertConfig.from_pretrained("bert-base-uncased")
         encoder_config = BertConfig.from_pretrained("./bert-base-uncased", local_files_only=True)
@@ -64,6 +90,7 @@ class Blip2Base(BaseModel):
         query_tokens.data.normal_(mean=0.0, std=encoder_config.initializer_range)
         extra_query_tokens.data.normal_(mean=0.0, std=encoder_config.initializer_range)
         return Qformer, query_tokens, extra_query_tokens
+
 
     @classmethod
     def init_vision_encoder(cls, model_name, img_size, drop_path_rate, use_grad_checkpoint, precision):

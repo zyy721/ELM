@@ -10,6 +10,8 @@ from lavis.datasets.builders.base_dataset_builder import BaseDatasetBuilder
 from lavis.common.registry import registry
 from lavis.datasets.datasets.elm_datasets import ELMDataset, ELMDatasetEvalDataset
 
+from lavis.datasets.datasets.elm_datasets_vqgan import ELMDatasetVQGAN, ELMDatasetEvalDatasetVQGAN
+
 
 @registry.register_builder("elm")
 class ELMBuilder(BaseDatasetBuilder):
@@ -18,3 +20,10 @@ class ELMBuilder(BaseDatasetBuilder):
 
     DATASET_CONFIG_DICT = {"default": "configs/datasets/elm/defaults.yaml"}
 
+
+@registry.register_builder("elmvqgan")
+class ELMBuilder(BaseDatasetBuilder):
+    train_dataset_cls = ELMDatasetVQGAN
+    eval_dataset_cls = ELMDatasetEvalDatasetVQGAN
+
+    DATASET_CONFIG_DICT = {"default": "configs/datasets/elmvqgan/defaults.yaml"}

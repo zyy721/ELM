@@ -1676,6 +1676,11 @@ class T5ForConditionalGeneration(T5PreTrainedModel):
 
         self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
 
+        ##########################
+        # self.vqgan_head = nn.Linear(config.d_model, 1024, bias=False)
+        ##########################
+
+
         # Initialize weights and apply final processing
         self.post_init()
 
@@ -1750,6 +1755,9 @@ class T5ForConditionalGeneration(T5PreTrainedModel):
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
         reduction: Optional[str] = "mean",
+
+        vqgan: Optional[bool] = None,
+
     ) -> Union[Tuple[torch.FloatTensor], Seq2SeqLMOutput]:
         r"""
         labels (`torch.LongTensor` of shape `(batch_size,)`, *optional*):
@@ -1867,7 +1875,15 @@ class T5ForConditionalGeneration(T5PreTrainedModel):
             # See https://github.com/tensorflow/mesh/blob/fa19d69eafc9a482aff0b59ddd96b025c0cb207d/mesh_tensorflow/transformer/transformer.py#L586
             sequence_output = sequence_output * (self.model_dim**-0.5)
 
+        ###########################
+        if vqgan is not None:
+            return sequence_output
+        ###########################
+
         lm_logits = self.lm_head(sequence_output)
+
+        # lm_logits = self.vqgan_head(sequence_output)
+
 
         loss = None
         if labels is not None:
