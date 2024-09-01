@@ -17,6 +17,9 @@ from lavis.tasks.base_task import BaseTask
 import numpy as np
 import copy, random
 
+from lavis.common.dist_utils import get_rank, get_world_size, is_main_process, is_dist_avail_and_initialized
+import torch
+
 
 @registry.register_task("vqa")
 class VQATask(BaseTask):
@@ -113,7 +116,7 @@ class VQATask(BaseTask):
 
         return pred_qa_pairs
 
-    def after_evaluation(self, val_result, split_name, epoch):
+    def after_evaluation(self, val_result, split_name, epoch, model):
         result_file = self.save_result(
             val_result,
             result_dir=registry.get_path("result_dir"),
@@ -158,6 +161,114 @@ class VQATask(BaseTask):
 
         return metrics
 
+
+@registry.register_task("occ")
+class OccTask(VQATask):
+    def valid_step(self, model, samples):
+
+        answers = model.predict_answers(
+            samples=samples,
+            answer_list=self.answer_list,
+            inference_method=self.inference_method,
+            num_beams=self.num_beams,
+            max_len=self.max_len,
+            min_len=self.min_len,
+            num_ans_candidates=self.num_ans_candidates,
+            prompt=self.prompt,
+        )
+        pred_qa_pairs = []
+
+        # gt_answers = samples["answers"]
+        # questions = samples["questions"]
+
+        # for answer, gt_answer, ques in zip(answers, gt_answers, questions):
+        #     pred_qa_pairs.append({"question": ques, "answer": answer, "gt_answer": gt_answer})
+
+        for occ, ego_pose, ego_label, ego_L2 in zip(answers['occ'], answers['ego_pose'], answers['ego_label'], answers['ego_L2']):
+            pred_qa_pairs.append({"occ": occ, "ego_pose": ego_pose, "ego_label": ego_label, "ego_L2": ego_L2})
+
+        return pred_qa_pairs
+
+    def after_evaluation(self, val_result, split_name, epoch, model):
+        local_rank = get_rank()
+        results = val_result
+
+        CalMeanIou_sem = model.miou
+        CalMeanIou_vox = model.iou
+
+        # miou, _ = CalMeanIou_sem._after_epoch(local_rank)
+        # iou, _ = CalMeanIou_vox._after_epoch(local_rank)
+
+        miou, _ = CalMeanIou_sem._after_epoch_single_gpu()
+        iou, _ = CalMeanIou_vox._after_epoch_single_gpu()
+
+        # if is_main_process():
+        #     print(f"miou 0s {miou[6]:.2f} 1s {miou[8]:.2f} 2s {miou[10]:.2f} 3s {miou[12]:.2f}")
+        #     print(f"iou 0s {iou[6]:.2f} 1s {iou[8]:.2f} 2s {iou[10]:.2f} 3s {iou[12]:.2f}")
+
+        # ego = torch.from_numpy(results.predictions[-1]["ego_L2"]).mean(dim=0)
+
+        for cur in results["ego_L2"]:
+            print()
+            
+        ego = torch.from_numpy(results["ego_L2"]).mean(dim=0)
+
+        
+
+        # if is_main_process():
+        #     print(f"ego 0s {ego[6]:.2f} 1s {ego[8]:.2f} 2s {ego[10]:.2f} 3s {ego[12]:.2f}")
+        
+        # if not training_args.only_calc_metrics and local_rank == 0:
+        if is_main_process():
+            if isinstance(results.predictions[-1], dict):
+                occ = results.predictions[-1]["occ"]
+            elif isinstance(results.predictions, tuple):
+                occ = results.predictions[-1]
+            else:
+                occ = results.predictions
+            
+            occ_label = results.label_ids
+            print(occ.shape, occ_label.shape)
+            
+            dataset_name = 'valset'
+            self.save_occ_results(registry.get_path("result_dir"), occ, occ_label, dataset_name)
+
+        metrics = self._report_metrics()
+
+        return metrics
+
+    @dist_utils.main_process
+    def _report_metrics(self, result_file=None, split=None):
+        """
+        Use official VQA evaluation script to report metrics.
+        """
+        metrics = {}
+
+        # if split in self.ques_files and split in self.anno_files:
+        #     vqa = VQA(self.anno_files[split], self.ques_files[split])
+        #     vqa_result = vqa.loadRes(resFile=result_file, quesFile=self.ques_files[split])
+
+        #     # create vqaEval object by taking vqa and vqaRes
+        #     # n is precision of accuracy (number of places after decimal), default is 2
+        #     vqa_scorer = VQAEval(vqa, vqa_result, n=2)
+        #     logging.info("Start VQA evaluation.")
+        #     vqa_scorer.evaluate()
+
+        #     # print accuracies
+        #     overall_acc = vqa_scorer.accuracy["overall"]
+        #     metrics["agg_metrics"] = overall_acc
+
+        #     logging.info("Overall Accuracy is: %.02f\n" % overall_acc)
+        #     logging.info("Per Answer Type Accuracy is the following:")
+
+        #     for ans_type in vqa_scorer.accuracy["perAnswerType"]:
+        #         logging.info("%s : %.02f" % (ans_type, vqa_scorer.accuracy["perAnswerType"][ans_type]))
+        #         metrics[ans_type] = vqa_scorer.accuracy["perAnswerType"][ans_type]
+
+        #     with open(os.path.join(registry.get_path("output_dir"), "evaluate.txt"), "a") as f:
+        #         f.write(json.dumps(metrics) + "\n")
+
+        return metrics
 
 # @registry.register_task("gqa")
 # GQATask = VQATask

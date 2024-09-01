@@ -15,6 +15,14 @@ from lavis.models.base_model import BaseModel
 from lavis.models.blip2_models.blip2 import Blip2Base
 from lavis.models.blip2_models.blip2_3dvqa_t5_elm import Blip2VQAT5ELM
 from lavis.models.blip2_models.blip2_3dvqa_t5_elm_vqgan import Blip2VQAT5ELMVQGAN
+from lavis.models.blip2_models.blip2_3dvqa_t5_elm_video import Blip2VQAT5ELMVideo
+from lavis.models.blip2_models.blip2_3dvqa_t5_elm_video_debug import Blip2VQAT5ELMVideoDebug
+from lavis.models.blip2_models.blip2_3dvqa_t5_elm_video_debug_rec_img import Blip2VQAT5ELMVideoDebugRecImg
+from lavis.models.blip2_models.blip2_3dvqa_t5_elm_video_ego_pose import Blip2VQAT5ELMVideoEgoPose
+from lavis.models.blip2_models.blip2_3dvqa_t5_elm_video_ego_gt import Blip2VQAT5ELMVideoEgoGt
+from lavis.models.blip2_models.blip2_3dvqa_t5_elm_video_occ import Blip2VQAT5ELMVideoOcc
+from lavis.models.blip2_models.blip2_3dvqa_t5_elm_video_ego_gt_random_mask import Blip2VQAT5ELMVideoEgoGtRandomMask
+from lavis.models.blip2_models.blip2_3dvqa_t5_elm_video_ego_gt_timestep import Blip2VQAT5ELMVideoEgoGtTimestep
 
 from lavis.models.med import XBertLMHeadDecoder
 from lavis.models.vit import VisionTransformerEncoder

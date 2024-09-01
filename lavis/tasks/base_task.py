@@ -8,6 +8,8 @@
 import logging
 import os
 
+import numpy as np
+
 import torch
 import torch.distributed as dist
 from lavis.common.dist_utils import get_rank, get_world_size, is_main_process, is_dist_avail_and_initialized
@@ -288,3 +290,17 @@ class BaseTask:
             print("result file saved to %s" % final_result_file)
 
         return final_result_file
+
+    @staticmethod
+    def save_occ_results(save_dir, predictions, label_ids, name='debug'):
+        # save
+        from tqdm import tqdm
+        path = os.path.join(save_dir, name)
+        os.makedirs(path, exist_ok=True)
+        with torch.no_grad():
+            for i_iter, (occ, occ_label) in tqdm(enumerate(zip(predictions, label_ids))):
+                # save occ
+                with open(os.path.join(path, f'{i_iter}_occs.npy'), 'wb') as f:
+                    np.save(f, occ)
+                with open(os.path.join(path, f'{i_iter}_occs_label.npy'), 'wb') as f:
+                    np.save(f, occ_label)

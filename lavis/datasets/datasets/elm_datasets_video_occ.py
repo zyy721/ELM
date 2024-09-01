@@ -1,0 +1,1960 @@
+"""
+ Copyright (c) 2022, salesforce.com, inc.
+ All rights reserved.
+ SPDX-License-Identifier: BSD-3-Clause
+ For full license text, see the LICENSE file in the repo root or https://opensource.org/licenses/BSD-3-Clause
+"""
+
+import os
+import json
+import torch
+import numpy as np
+import pickle
+
+from PIL import Image
+from PIL import ImageFile
+
+ImageFile.LOAD_TRUNCATED_IMAGES = True
+
+from lavis.datasets.datasets.vqa_datasets import VQADataset, VQAEvalDataset
+from lavis.datasets.data_utils import load_video_features, pad_video_seq, pad_seq, pad_char_seq, load_pickle
+from nuscenes.nuscenes import NuScenes
+import re
+from collections import OrderedDict
+import tqdm
+import random
+
+from lavis.models.taming_transformers.taming.data.base import ImagePaths, NumpyPaths, ConcatDatasetWithIndex
+
+from mmengine import Config
+import copy
+from lavis.models.OccWorld.dataset import get_dataset
+
+
+local_rank = None
+first_print = True
+
+def rank0_print(*args):
+    if local_rank == 0:
+        print(*args)
+
+
+def load_json_file(file_path):
+    with open(file_path, 'r') as file:
+        data = json.load(file)
+    return data
+
+def codalm_load_json_file(file_path):
+    file = open(file_path, 'r', encoding='utf-8')
+    papers = []
+    for line in file.readlines():
+        dic = json.loads(line)
+        papers.append(dic)
+    return papers
+
+
+class __DisplMixin:
+    def displ_item(self, index):
+        sample, ann = self.__getitem__(index), self.annotation[index]
+
+        return OrderedDict(
+            {
+                "file": ann["image"],
+                "question": ann["question"],
+                "question_id": ann["question_id"],
+                "answer": "; ".join(ann["answers"]),
+                "pc_feat": sample["pc_feat"],
+                "pc": sample["pc"],
+            }
+        )
+
+def get_img_frames(clip_id, timestamp_frame):
+    img_dir = "data/ego4d/output_data_narra"
+    img_path = os.path.join(img_dir, clip_id)
+    file_pattern = f"frame_{timestamp_frame}_"
+
+    for root, dirnames, filenames in os.walk(img_path):
+        for filename in filenames:
+            if file_pattern in filename:
+                full_path = os.path.join(root, filename)
+                return full_path
+    return None
+
+
+class ELMDatasetVideoOcc(VQADataset, __DisplMixin):
+    def __init__(self, vis_processor=None, text_processor=None, vis_root=None, ann_paths=None, occ_config=None,
+                 random_flip=False, random_crop=False, non_leaky_prob=[0.8, 0.4]):
+        """
+        vis_root (string): Root directory of images (e.g. coco/images/)
+        ann_root (string): directory to store the annotation file
+        """
+
+        occ_config = 'lavis/models/OccWorld/config/train_vqvae.py'
+        cfg = Config.fromfile(occ_config)
+
+        train_dataset_occ, val_dataset_occ= get_dataset(
+            cfg.train_dataset_config,
+            cfg.val_dataset_config,
+        )
+
+        self.point_cloud_dataset = train_dataset_occ
+        # self.used_class = ['car', 'truck', 'pedestrian']
+        # self.tokenizer = tokenizer
+        # self.max_length = 24
+        # self.padding_token = tokenizer(' ').input_ids[1] # tianshuo, use space as padding 259
+        self.non_leaky_prob = non_leaky_prob
+
+        self.random_flip = random_flip
+        self.random_crop = random_crop
+
+        rank0_print('non leaky prob:', self.non_leaky_prob)
+        rank0_print(f'random_flip: {random_flip}, random_crop: {random_crop}')
+        # rank0_print('padding token:', self.padding_token)
+        # rank0_print('text tokens max length:', self.max_length)
+
+
+
+        self.answers = []
+        self.questions = []
+        self.images = []
+        self.first_img = None
+
+        self.vis_root = vis_root
+        self.vis_processor = vis_processor
+        self.text_processor = text_processor
+
+        self.num_to_vocab = {}
+        self.num_threshold = 30000
+
+        with open('data/vocab.txt', 'r') as file:
+            for line_number, line_content in enumerate(file, 1):
+                line_content = line_content.strip()
+                if line_number>=(self.num_threshold-1000):
+                    self.num_to_vocab[line_number] = line_content
+
+
+
+
+        # self.default_drivelm(ann_paths)
+        self.tmp_imglist = []
+        # self.temporal_length = 1
+        # self.default_boxqa(ann_paths)
+
+        # self.default_boxqa_det_track_pred(ann_paths)
+        # self.configure_traffic()
+        # self.default_traffic()
+        # self.default_drivelm()
+        # self.default_nuscenes_reconstruct()
+        # self.default_nuscenes_video()
+        # self.default_nuscenes_video_v2()
+        self.default_nuscenes_video_ego_pose()
+        # self.default_codalm()
+
+        self.data_images = ImagePaths(paths=self.images, size=256, random_crop=False)
+
+        # print("The number of data: ", len(self.questions))
+        # print("The number of data: ", len(self.tmp_imglist))
+        # print("The number of data: ", len(self.nusc_infos)*self.times)
+        # print("The number of data: ", len(self.scene_videos))
+        print("The number of data: ", len(self.point_cloud_dataset))
+
+
+    def configure_traffic(self):
+        data_root = 'data/openlane_v2_nus'
+        with open(data_root + '/data_dict_subset_B_train.pkl', 'rb') as f:
+            data_infos = pickle.load(f)
+        
+        data_infos = list(data_infos.values())
+        
+        # data_infos = random.sample(data_infos, 90)
+
+        nuscenes_info = pickle.load(open("data/nuscenes/bevdetv2-nuscenes_infos_train.pkl", "rb"))["infos"]
+        self.traffic_element_dict = {}
+        for cur_nuscenes_info in nuscenes_info:
+            self.traffic_element_dict[cur_nuscenes_info['scene_token']] = {}
+
+        num=0
+        
+        for info in tqdm.tqdm(data_infos):
+            ann_info = info['annotation']
+            timestamp = info['timestamp']
+            scene_id = info['meta_data']['source_id']
+
+            if scene_id not in self.traffic_element_dict.keys():
+                self.traffic_element_dict[scene_id] = {}
+
+            gt_lanes = [np.array(lane['points'], dtype=np.float32) for lane in ann_info['lane_centerline']]
+            te_bboxes = np.array([np.array(sign['points'], dtype=np.float32).flatten() for sign in ann_info['traffic_element']])
+            if len(te_bboxes) == 0:
+                te_bboxes = np.zeros((0, 4), dtype=np.float32)
+
+            distance = []
+            for i in range(len(gt_lanes)):
+                distance.append((sum(sum(np.array(gt_lanes[i])**2))**0.5)/len(gt_lanes[i]))
+            te_list = []
+            for i in range(len(ann_info['traffic_element'])):
+                te_ann = ann_info['traffic_element'][i]
+                attribute = te_ann['attribute']
+                if attribute>=4:
+                    num+=1
+                    te_list.append(attribute)
+            
+            self.traffic_element_dict[scene_id][timestamp] = te_list
+        print("The number of total traffic elements: ", num)
+
+
+    def default_traffic(self):
+        self.te_convert = {
+            0:  'unknown',
+            1:  'red',
+            2:  'green',
+            3:  'yellow',
+            4:  'go_straight',
+            5:  'turn_left',
+            6:  'turn_right',
+            7:  'no_left_turn',
+            8:  'no_right_turn',
+            9:  'u_turn',
+            10: 'no_u_turn',
+            11: 'slight_left',
+            12: 'slight_right',
+        }
+
+        self.temporal_length = 6
+        self.data_info = pickle.load(open("data/nuscenes/bevdetv2-nuscenes_infos_trainval.pkl", "rb"))["infos"]
+
+        neg_num = 0
+        pos_num = 0
+        for idx, info in enumerate(self.data_info):
+            scene_token = info['scene_token']
+            timestamp = info['cams']['CAM_FRONT']['timestamp']
+            image_path = info['cams']["CAM_FRONT"]['data_path']
+            if scene_token not in self.traffic_element_dict:
+                continue   
+            value = self.traffic_element_dict[scene_token]
+            if timestamp in value:
+                # temporal data only for image path
+                tmp_image = []
+                history_te = [self.traffic_element_dict[scene_token][timestamp]]
+                for tmp in range(1, self.temporal_length+1):
+                    if scene_token != self.data_info[idx-tmp]['scene_token']:
+                        continue
+                    tmp_path = self.data_info[idx-tmp]['cams']['CAM_FRONT']['data_path']
+                    tmp_image.append(tmp_path)
+
+                    timestamp = self.data_info[idx-tmp]['cams']['CAM_FRONT']['timestamp']
+                    scene_id = self.data_info[idx-tmp]['scene_token']
+                    if scene_id not in self.traffic_element_dict.keys():
+                        continue
+                    if timestamp not in self.traffic_element_dict[scene_id].keys():
+                        continue
+                    history_te.append(self.traffic_element_dict[scene_id][timestamp])
+
+                # if the image path is not equal self.temporal length, then use the duplicate image path
+                tmp_image = tmp_image[::-1]
+                if len(tmp_image) != self.temporal_length:
+                    if len(tmp_image) != 0:
+                        tmp_image = tmp_image[:1] * (self.temporal_length - len(tmp_image)) + tmp_image
+                    else:
+                        tmp_image = [image_path] * self.temporal_length
+                assert len(tmp_image) == self.temporal_length
+
+                # get the traffic element 
+                longest_list = max(history_te, key=len)
+
+                # num_valid = 0
+                # for cur_history_te in history_te:
+                #     if len(cur_history_te) > 0:
+                #         num_valid += 1
+
+                # if num_valid > 1:
+                #     print()
+
+                element_counts = {}
+                for element in longest_list:
+                    if element in element_counts:
+                        element_counts[element] += 1
+                    else:
+                        element_counts[element] = 1
+
+                length = len(element_counts)
+                Traffic_q = 'Has the ego vehicle seen any traffic sign before?'
+                if length==0:
+                    Traffic_a = 'No. There is no traffic sign in the scene.'
+                if length==1:
+                    Traffic_a = f'Yes. The ego vehicle has seen {element_counts[longest_list[0]]} {self.te_convert[longest_list[0]]} before.'
+                if length==2:
+                    Traffic_a = f'Yes. The ego vehicle has seen {element_counts[longest_list[0]]} {self.te_convert[longest_list[0]]} and {element_counts[longest_list[1]]} {self.te_convert[longest_list[1]]} before.'
+                if length==3:
+                    Traffic_a = f'Yes. The ego vehicle has seen {element_counts[longest_list[0]]} {self.te_convert[longest_list[0]]}, {element_counts[longest_list[1]]} {self.te_convert[longest_list[1]]} and {element_counts[longest_list[2]]} {self.te_convert[longest_list[2]]} before.'
+                if length==4:
+                    Traffic_a = f'Yes. The ego vehicle has seen {element_counts[longest_list[0]]} {self.te_convert[longest_list[0]]}, {element_counts[longest_list[1]]} {self.te_convert[longest_list[1]]}, {element_counts[longest_list[2]]} {self.te_convert[longest_list[2]]} and {element_counts[longest_list[3]]} {self.te_convert[longest_list[3]]} before.'
+                if length==5:
+                    Traffic_a = f'Yes. The ego vehicle has seen {element_counts[longest_list[0]]} {self.te_convert[longest_list[0]]}, {element_counts[longest_list[1]]} {self.te_convert[longest_list[1]]}, {element_counts[longest_list[2]]} {self.te_convert[longest_list[2]]}, {element_counts[longest_list[3]]} {self.te_convert[longest_list[3]]} and {element_counts[longest_list[4]]} {self.te_convert[longest_list[4]]} before.'
+                if length==6:
+                    Traffic_a = f'Yes. The ego vehicle has seen {element_counts[longest_list[0]]} {self.te_convert[longest_list[0]]}, {element_counts[longest_list[1]]} {self.te_convert[longest_list[1]]}, {element_counts[longest_list[2]]} {self.te_convert[longest_list[2]]}, {element_counts[longest_list[3]]} {self.te_convert[longest_list[3]]}, {element_counts[longest_list[4]]} {self.te_convert[longest_list[4]]} and {element_counts[longest_list[5]]} {self.te_convert[longest_list[5]]} before.'
+                if length==7:
+                    Traffic_a = f'Yes. The ego vehicle has seen {element_counts[longest_list[0]]} {self.te_convert[longest_list[0]]}, {element_counts[longest_list[1]]} {self.te_convert[longest_list[1]]}, {element_counts[longest_list[2]]} {self.te_convert[longest_list[2]]}, {element_counts[longest_list[3]]} {self.te_convert[longest_list[3]]}, {element_counts[longest_list[4]]} {self.te_convert[longest_list[4]]}, {element_counts[longest_list[5]]} {self.te_convert[longest_list[5]]} and {element_counts[longest_list[6]]} {self.te_convert[longest_list[6]]} before.'
+                if length==8:
+                    Traffic_a = f'Yes. The ego vehicle has seen {element_counts[longest_list[0]]} {self.te_convert[longest_list[0]]}, {element_counts[longest_list[1]]} {self.te_convert[longest_list[1]]}, {element_counts[longest_list[2]]} {self.te_convert[longest_list[2]]}, {element_counts[longest_list[3]]} {self.te_convert[longest_list[3]]}, {element_counts[longest_list[4]]} {self.te_convert[longest_list[4]]}, {element_counts[longest_list[5]]} {self.te_convert[longest_list[5]]}, {element_counts[longest_list[6]]} {self.te_convert[longest_list[6]]} and {element_counts[longest_list[7]]} {self.te_convert[longest_list[7]]} before.'
+                if length==9:
+                    Traffic_a = f'Yes. The ego vehicle has seen {element_counts[longest_list[0]]} {self.te_convert[longest_list[0]]}, {element_counts[longest_list[1]]} {self.te_convert[longest_list[1]]}, {element_counts[longest_list[2]]} {self.te_convert[longest_list[2]]}, {element_counts[longest_list[3]]} {self.te_convert[longest_list[3]]}, {element_counts[longest_list[4]]} {self.te_convert[longest_list[4]]}, {element_counts[longest_list[5]]} {self.te_convert[longest_list[5]]}, {element_counts[longest_list[6]]} {self.te_convert[longest_list[6]]}, {element_counts[longest_list[7]]} {self.te_convert[longest_list[7]]} and {element_counts[longest_list[8]]} {self.te_convert[longest_list[8]]} before.'
+                if length==10:
+                    Traffic_a = f'Yes. The ego vehicle has seen {element_counts[longest_list[0]]} {self.te_convert[longest_list[0]]}, {element_counts[longest_list[1]]} {self.te_convert[longest_list[1]]}, {element_counts[longest_list[2]]} {self.te_convert[longest_list[2]]}, {element_counts[longest_list[3]]} {self.te_convert[longest_list[3]]}, {element_counts[longest_list[4]]} {self.te_convert[longest_list[4]]}, {element_counts[longest_list[5]]} {self.te_convert[longest_list[5]]}, {element_counts[longest_list[6]]} {self.te_convert[longest_list[6]]}, {element_counts[longest_list[7]]} {self.te_convert[longest_list[7]]}, {element_counts[longest_list[8]]} {self.te_convert[longest_list[8]]} and {element_counts[longest_list[9]]} {self.te_convert[longest_list[9]]} before.'
+                if length==11:
+                    Traffic_a = f'Yes. The ego vehicle has seen {element_counts[longest_list[0]]} {self.te_convert[longest_list[0]]}, {element_counts[longest_list[1]]} {self.te_convert[longest_list[1]]}, {element_counts[longest_list[2]]} {self.te_convert[longest_list[2]]}, {element_counts[longest_list[3]]} {self.te_convert[longest_list[3]]}, {element_counts[longest_list[4]]} {self.te_convert[longest_list[4]]}, {element_counts[longest_list[5]]} {self.te_convert[longest_list[5]]}, {element_counts[longest_list[6]]} {self.te_convert[longest_list[6]]}, {element_counts[longest_list[7]]} {self.te_convert[longest_list[7]]}, {element_counts[longest_list[8]]} {self.te_convert[longest_list[8]]}, {element_counts[longest_list[9]]} {self.te_convert[longest_list[9]]} and {element_counts[longest_list[10]]} {self.te_convert[longest_list[10]]} before.'
+                if length==12:
+                    Traffic_a = f'Yes. The ego vehicle has seen {element_counts[longest_list[0]]} {self.te_convert[longest_list[0]]}, {element_counts[longest_list[1]]} {self.te_convert[longest_list[1]]}, {element_counts[longest_list[2]]} {self.te_convert[longest_list[2]]}, {element_counts[longest_list[3]]} {self.te_convert[longest_list[3]]}, {element_counts[longest_list[4]]} {self.te_convert[longest_list[4]]}, {element_counts[longest_list[5]]} {self.te_convert[longest_list[5]]}, {element_counts[longest_list[6]]} {self.te_convert[longest_list[6]]}, {element_counts[longest_list[7]]} {self.te_convert[longest_list[7]]}, {element_counts[longest_list[8]]} {self.te_convert[longest_list[8]]}, {element_counts[longest_list[9]]} {self.te_convert[longest_list[9]]}, {element_counts[longest_list[10]]} {self.te_convert[longest_list[10]]} and {element_counts[longest_list[11]]} {self.te_convert[longest_list[11]]} before.'
+                if length==13:
+                    Traffic_a = f'Yes. The ego vehicle has seen {element_counts[longest_list[0]]} {self.te_convert[longest_list[0]]}, {element_counts[longest_list[1]]} {self.te_convert[longest_list[1]]}, {element_counts[longest_list[2]]} {self.te_convert[longest_list[2]]}, {element_counts[longest_list[3]]} {self.te_convert[longest_list[3]]}, {element_counts[longest_list[4]]} {self.te_convert[longest_list[4]]}, {element_counts[longest_list[5]]} {self.te_convert[longest_list[5]]}, {element_counts[longest_list[6]]} {self.te_convert[longest_list[6]]}, {element_counts[longest_list[7]]} {self.te_convert[longest_list[7]]}, {element_counts[longest_list[8]]} {self.te_convert[longest_list[8]]}, {element_counts[longest_list[9]]} {self.te_convert[longest_list[9]]}, {element_counts[longest_list[10]]} {self.te_convert[longest_list[10]]}, {element_counts[longest_list[11]]} {self.te_convert[longest_list[11]]} and {element_counts[longest_list[12]]} {self.te_convert[longest_list[12]]} before.'
+                if length==14:
+                    Traffic_a = f'Yes. The ego vehicle has seen {element_counts[longest_list[0]]} {self.te_convert[longest_list[0]]}, {element_counts[longest_list[1]]} {self.te_convert[longest_list[1]]}, {element_counts[longest_list[2]]} {self.te_convert[longest_list[2]]}, {element_counts[longest_list[3]]} {self.te_convert[longest_list[3]]}, {element_counts[longest_list[4]]} {self.te_convert[longest_list[4]]}, {element_counts[longest_list[5]]} {self.te_convert[longest_list[5]]}, {element_counts[longest_list[6]]} {self.te_convert[longest_list[6]]}, {element_counts[longest_list[7]]} {self.te_convert[longest_list[7]]}, {element_counts[longest_list[8]]} {self.te_convert[longest_list[8]]}, {element_counts[longest_list[9]]} {self.te_convert[longest_list[9]]}, {element_counts[longest_list[10]]} {self.te_convert[longest_list[10]]}, {element_counts[longest_list[11]]} {self.te_convert[longest_list[11]]}, {element_counts[longest_list[12]]} {self.te_convert[longest_list[12]]} and {element_counts[longest_list[13]]} {self.te_convert[longest_list[13]]} before.'
+                if length==15:
+                    Traffic_a = f'Yes. The ego vehicle has seen {element_counts[longest_list[0]]} {self.te_convert[longest_list[0]]}, {element_counts[longest_list[1]]} {self.te_convert[longest_list[1]]}, {element_counts[longest_list[2]]} {self.te_convert[longest_list[2]]}, {element_counts[longest_list[3]]} {self.te_convert[longest_list[3]]}, {element_counts[longest_list[4]]} {self.te_convert[longest_list[4]]}, {element_counts[longest_list[5]]} {self.te_convert[longest_list[5]]}, {element_counts[longest_list[6]]} {self.te_convert[longest_list[6]]}, {element_counts[longest_list[7]]} {self.te_convert[longest_list[7]]}, {element_counts[longest_list[8]]} {self.te_convert[longest_list[8]]}, {element_counts[longest_list[9]]} {self.te_convert[longest_list[9]]}, {element_counts[longest_list[10]]} {self.te_convert[longest_list[10]]}, {element_counts[longest_list[11]]} {self.te_convert[longest_list[11]]}, {element_counts[longest_list[12]]} {self.te_convert[longest_list[12]]}, {element_counts[longest_list[13]]} {self.te_convert[longest_list[13]]} and {element_counts[longest_list[14]]} {self.te_convert[longest_list[14]]} before.'
+
+                if (length == 0 and idx % 3 == 0) or (length != 0):
+                    if length == 0:
+                        neg_num += 1
+                    else:
+                        pos_num += 1
+                    self.images.append(image_path)
+                    cur_tmp_image = tmp_image + [image_path]
+                    self.tmp_imglist.append(cur_tmp_image)
+                    self.questions.append(Traffic_q)
+                    self.answers.append([Traffic_a])
+        
+        print("The number of traffic questions: ", len(self.questions))
+        print("The number of positive questions: ", pos_num)
+        print("The number of negative questions: ", neg_num)
+
+
+    # def default_drivelm(self, ann_paths):
+    def default_drivelm(self):
+        self.temporal_length = 6
+
+        # self.annotation = json.load(open(ann_paths[0], "r"))
+        self.annotation = json.load(open('data/drivelm_train.json', "r"))
+        
+        # all_scene_w_behavior = []
+        # for cur_scene_value in self.annotation.values():
+        #     for cur_key_frame_value in cur_scene_value['key_frame'].values():
+        #         if 'Perception' in cur_key_frame_value:
+        #             cur_perception = cur_key_frame_value['Perception']
+
+        #             for cur_perception_value in cur_perception['q']:
+        #                 if 'behavior' in cur_perception_value:
+        #                     all_scene_w_behavior.append(cur_key_frame_value)
+        #                     print(cur_perception_value)
+
+        #         if 'Prediction and Planning' in cur_key_frame_value:
+        #             cur_pred_plan = cur_key_frame_value['Prediction and Planning']
+
+        #             for cur_pred_plan_value in cur_pred_plan['q']:
+        #                 if 'behavior' in cur_pred_plan_value:
+        #                     all_scene_w_behavior.append(cur_key_frame_value)
+        #                     print(cur_pred_plan_value)
+                
+        self.data_info = pickle.load(open("data/nuscenes/bevdetv2-nuscenes_infos_train.pkl", "rb"))["infos"]
+        for idx, info in enumerate(self.data_info):
+            scene_token = info['scene_token']
+            timestamp = info['cams']['CAM_FRONT']['timestamp']
+            image_path = info['cams']["CAM_FRONT"]['data_path']
+
+            if scene_token not in self.annotation:
+                continue
+            value = self.annotation[scene_token]
+            # scene_description = value['scene_description']
+            scene_key_frame = value['key_frame']
+            frame_id = str(timestamp)
+            if frame_id in scene_key_frame:
+                # temporal data only for image path
+                tmp_image = []
+                for tmp in range(1, self.temporal_length+1):
+                    if scene_token != self.data_info[idx-tmp]['scene_token']:
+                        continue
+                    tmp_path = self.data_info[idx-tmp]['cams']['CAM_FRONT']['data_path']
+                    tmp_image.append(tmp_path)
+
+                # if the image path is not equal self.temporal length, then use the duplicate image path
+                tmp_image = tmp_image[::-1]
+                if len(tmp_image) != self.temporal_length:
+                    if len(tmp_image) != 0:
+                        tmp_image = tmp_image[:1] * (self.temporal_length - len(tmp_image)) + tmp_image
+                    else:
+                        tmp_image = [image_path] * self.temporal_length
+                assert len(tmp_image) == self.temporal_length
+
+                value1 = scene_key_frame[frame_id]
+
+                if "Perception" in value1:
+                    Perception_q = value1['Perception']['q']
+                    Perception_a = value1['Perception']['a']
+                else:
+                    Perception_q = []
+                    Perception_a = []
+
+                if "Prediction and Planning" in value1:
+                    Prediction_q = value1['Prediction and Planning']['q']
+                    Prediction_a = value1['Prediction and Planning']['a']
+                else:
+                    Prediction_q = []
+                    Prediction_a = []
+                                    
+
+                Question = Perception_q + Prediction_q
+                Answer = Perception_a + Prediction_a
+
+            
+                assert len(Question) == len(Answer)
+
+                for idx in range(len(Question)):                
+                    self.questions.append(Question[idx])
+                    self.answers.append([Answer[idx]])
+                    self.images.append(image_path)
+                    cur_tmp_image = tmp_image + [image_path]
+                    self.tmp_imglist.append(cur_tmp_image)
+
+    def default_nuscenes_reconstruct(self):
+        self.temporal_length = 0
+                        
+        self.data_info = pickle.load(open("data/nuscenes/bevdetv2-nuscenes_infos_train.pkl", "rb"))["infos"]
+
+        # self.data_info = random.sample(self.data_info, 100)
+
+        for idx, info in enumerate(self.data_info):
+            scene_token = info['scene_token']
+            timestamp = info['cams']['CAM_FRONT']['timestamp']
+            image_path = info['cams']["CAM_FRONT"]['data_path']
+
+            # temporal data only for image path
+            tmp_image = []
+            for tmp in range(1, self.temporal_length+1):
+                if scene_token != self.data_info[idx-tmp]['scene_token']:
+                    continue
+                tmp_path = self.data_info[idx-tmp]['cams']['CAM_FRONT']['data_path']
+                tmp_image.append(tmp_path)
+
+            # if the image path is not equal self.temporal length, then use the duplicate image path
+            tmp_image = tmp_image[::-1]
+            if len(tmp_image) != self.temporal_length:
+                if len(tmp_image) != 0:
+                    tmp_image = tmp_image[:1] * (self.temporal_length - len(tmp_image)) + tmp_image
+                else:
+                    tmp_image = [image_path] * self.temporal_length
+            assert len(tmp_image) == self.temporal_length
+
+            self.images.append(image_path)
+            cur_tmp_image = tmp_image + [image_path]
+            self.tmp_imglist.append(cur_tmp_image)
+
+
+    def default_nuscenes_video(self):
+        imageset = "data/nuscenes/nuscenes_infos_train_temporal_v3_scene.pkl"
+        with open(imageset, 'rb') as f:
+            data = pickle.load(f)
+        
+        self.nusc_infos = data['infos']
+        self.scene_names = list(self.nusc_infos.keys())   
+
+        self.scene_lens = [len(self.nusc_infos[sn]) for sn in self.scene_names]
+        self.return_len = 6
+        self.offset = 0        
+        self.times = 20
+
+        idx_image = 0
+        self.idx_image_nusc_info = {}
+        for cur_scene_name in self.scene_names:
+            self.idx_image_nusc_info[cur_scene_name] = []
+            for cur_info in self.nusc_infos[cur_scene_name]:
+                image_path = cur_info['cams']['CAM_FRONT']['data_path']
+                self.images.append(image_path)
+                self.idx_image_nusc_info[cur_scene_name].append(idx_image)
+                idx_image = idx_image + 1
+
+
+    def default_nuscenes_video_v2(self):
+        imageset = "data/nuscenes/nuscenes_infos_train_temporal_v3_scene.pkl"
+        with open(imageset, 'rb') as f:
+            data = pickle.load(f)
+        
+        self.nusc_infos = data['infos']
+        self.scene_names = list(self.nusc_infos.keys())   
+
+        self.scene_lens = [len(self.nusc_infos[sn]) for sn in self.scene_names]
+        self.return_len = 6
+        self.offset = 0        
+        self.times = 20
+
+        idx_image = 0
+        self.idx_image_nusc_info = {}
+
+        self.scene_videos = []
+
+        for cur_scene_name in self.scene_names:
+            self.idx_image_nusc_info[cur_scene_name] = []
+            for cur_info in self.nusc_infos[cur_scene_name]:
+                image_path = cur_info['cams']['CAM_FRONT']['data_path']
+                self.images.append(image_path)
+                self.idx_image_nusc_info[cur_scene_name].append(idx_image)
+                idx_image = idx_image + 1
+
+            cur_scene_len = len(self.nusc_infos[cur_scene_name])
+            if cur_scene_len >= self.return_len:
+                for start_idx in range(cur_scene_len - self.return_len + 1):
+                    self.scene_videos.append(self.idx_image_nusc_info[cur_scene_name][start_idx:start_idx+self.return_len])
+
+
+    def default_nuscenes_video_ego_pose(self):
+        imageset = "data/nuscenes/nuscenes_infos_train_temporal_v3_scene.pkl"
+        with open(imageset, 'rb') as f:
+            data = pickle.load(f)
+        
+        self.nusc_infos = data['infos']
+        self.scene_names = list(self.nusc_infos.keys())   
+
+        self.scene_lens = [len(self.nusc_infos[sn]) for sn in self.scene_names]
+        self.return_len = 6
+        self.offset = 0        
+        self.times = 20
+
+        idx_image = 0
+        self.idx_image_nusc_info = {}
+        self.gt_ego_poses = {}
+        self.gt_ego_poses_mask = {}
+
+        self.scene_videos = []
+        self.scene_videos_gt_ego_poses = []
+        self.scene_videos_gt_ego_poses_mask = []
+
+        for cur_scene_name in self.scene_names:
+            self.idx_image_nusc_info[cur_scene_name] = []
+            self.gt_ego_poses[cur_scene_name] = []
+            self.gt_ego_poses_mask[cur_scene_name] = []
+
+            for cur_info_idx, cur_info in enumerate(self.nusc_infos[cur_scene_name]):
+                # if cur_info_idx == 0:
+                #     self.gt_ego_poses[cur_scene_name].append(cur_info['gt_ego_his_trajs'][-1])
+
+                image_path = cur_info['cams']['CAM_FRONT']['data_path']
+                self.images.append(image_path)
+                self.idx_image_nusc_info[cur_scene_name].append(idx_image)
+                self.gt_ego_poses[cur_scene_name].append(cur_info['gt_ego_fut_trajs'][0])
+                self.gt_ego_poses_mask[cur_scene_name].append(cur_info['gt_ego_fut_masks'][0])
+
+                idx_image = idx_image + 1
+
+            cur_scene_len = len(self.nusc_infos[cur_scene_name])
+            if cur_scene_len >= self.return_len:
+                for start_idx in range(cur_scene_len - self.return_len + 1):
+                    self.scene_videos.append(self.idx_image_nusc_info[cur_scene_name][start_idx:start_idx+self.return_len])
+                    self.scene_videos_gt_ego_poses.append(self.gt_ego_poses[cur_scene_name][start_idx:start_idx+self.return_len])
+                    self.scene_videos_gt_ego_poses_mask.append(self.gt_ego_poses_mask[cur_scene_name][start_idx:start_idx+self.return_len])
+
+        self.scene_videos_gt_ego_poses = np.array(self.scene_videos_gt_ego_poses)
+        self.scene_videos_gt_ego_poses_mask = np.array(self.scene_videos_gt_ego_poses_mask)
+
+
+    def default_codalm(self):                        
+        # self.data_info_general_perception = codalm_load_json_file('/harddisk/yzhu/CODA-LM/data/CODA-LM/Train/vqa_anno/general_perception.jsonl')
+        # self.data_info_region_perception = codalm_load_json_file('/harddisk/yzhu/CODA-LM/data/CODA-LM/Train/vqa_anno/region_perception.jsonl')
+        # self.data_info_driving_suggestion = codalm_load_json_file('/harddisk/yzhu/CODA-LM/data/CODA-LM/Train/vqa_anno/driving_suggestion.jsonl')
+
+        self.data_info = codalm_load_json_file('/harddisk/yzhu/CODA-LM/data/CODA-LM/Train/vqa_anno/general_perception.jsonl')
+        
+        # self.data_info = random.sample(self.data_info, 100)
+
+        for idx, info in enumerate(self.data_info):
+            cur_image_path = '/harddisk/yzhu/CODA-LM/data/' + info['image']
+
+            self.questions.append(info['question'])
+            self.answers.append([info['answer']])
+            self.images.append(cur_image_path)
+            self.tmp_imglist.append([cur_image_path])
+
+
+    def default_ego4d(self):
+        data_path = "data/ego4d/v2/nlq_official_v2_omnivore_video_fp16_official_128_bert.pkl"
+        data = load_pickle(data_path)
+        self.train_data = data["train_set"]
+
+        # process answers
+        narration_file_path = "data/ego4d/v2/annotations/narration.json"
+        narration_data = load_json_file(narration_file_path)
+
+        nlq_file_path = "data/ego4d/v2/annotations/nlq_train.json"
+        nlq_data = load_json_file(nlq_file_path)
+
+        video_clip_dict = {}
+        clip_id_list = []
+
+        for video in nlq_data["videos"]:
+            video_uid = video['video_uid']
+            for clip in video['clips']:
+                clip_uid = clip['clip_uid']
+                clip_s_time = clip['video_start_sec']
+                clip_e_time = clip['video_end_sec']
+                video_clip_dict[clip_uid] = [video_uid, clip_s_time, clip_e_time]
+        
+        for i in tqdm.tqdm(range(len(self.train_data))):
+            record = self.train_data[i]
+            
+            clip_id, start_time, end_time = record["vid"], record["s_time"], record["e_time"]
+            s_ind, e_ind = record["s_ind"], record["e_ind"]
+            question = record["query"]
+            video_id = video_clip_dict[clip_id][0]
+            clip_s_time, clip_e_time = video_clip_dict[clip_id][1], video_clip_dict[clip_id][2]
+            video_clip = narration_data[video_id]
+            if clip_id in clip_id_list:
+                continue
+            else:
+                clip_id_list.append(clip_id)
+
+            narrations = []
+            if "narration_pass_1" in video_clip:
+                narrations += video_clip["narration_pass_1"]["narrations"]
+            if "narration_pass_2" in video_clip:
+                narrations += video_clip["narration_pass_2"]["narrations"]
+            for narration in narrations:
+                timestamp = narration['timestamp_sec']-clip_s_time
+                timestamp_frame = narration['timestamp_frame']
+                # assert timestamp>=0
+                if timestamp>=0 and timestamp<=480:
+                    img_path = get_img_frames(clip_id, timestamp_frame)
+                    if img_path is not None:
+                        self.questions.append("Give a caption.")
+                        self.answers.append([narration['narration_text'][3:]])
+                        self.images.append(img_path)
+
+    def default_boxqa(self, ann_paths, ann_type, temporal_length):
+        # self.annotation = json.load(open("data/box_detection_train.json", "r"))
+        # self.annotation = json.load(open("data/tracking_train.json", "r"))
+        # self.annotation = json.load(open("data/box_prediction_train.json", "r"))
+        # self.annotation = json.load(open("data/planning_train.json", "r"))
+
+        self.annotation = json.load(open(ann_paths, "r"))
+
+        # first_key, first_value = next(iter(self.annotation.items()))
+        # self.annotation = {}
+        # self.annotation[first_key] = first_value
+
+        self.temporal_length = temporal_length
+
+        self.data_info = pickle.load(open("data/nuscenes/bevdetv2-nuscenes_infos_trainval.pkl", "rb"))["infos"]
+        for idx, info in enumerate(self.data_info):
+            scene_token = info['scene_token']
+            timestamp = info['cams']['CAM_FRONT']['timestamp']
+            image_path = info['cams']["CAM_FRONT"]['data_path']
+
+            if scene_token not in self.annotation:
+                continue
+            value = self.annotation[scene_token]
+            # scene_description = value['scene_description']
+            scene_key_frame = value['key_frame']
+            frame_id = str(timestamp)
+            if frame_id in scene_key_frame:
+
+                # temporal data only for image path
+                tmp_image = []
+                for tmp in range(1, self.temporal_length+1):
+                    if scene_token != self.data_info[idx-tmp]['scene_token']:
+                        continue
+                    tmp_path = self.data_info[idx-tmp]['cams']['CAM_FRONT']['data_path']
+                    tmp_image.append(tmp_path)
+
+                # if the image path is not equal self.temporal length, then use the duplicate image path
+                tmp_image = tmp_image[::-1]
+                if len(tmp_image) != self.temporal_length:
+                    if len(tmp_image) != 0:
+                        tmp_image = tmp_image[:1] * (self.temporal_length - len(tmp_image)) + tmp_image
+                    else:
+                        tmp_image = [image_path] * self.temporal_length
+                assert len(tmp_image) == self.temporal_length
+
+                value1 = scene_key_frame[frame_id]
+
+                if value1 is None:
+                    continue
+
+                ####################### 
+                # if "BOX QA" in value1:
+                #     BOX_q = value1['BOX QA']['q']
+                #     BOX_a = value1['BOX QA']['a']
+                #     assert len(BOX_q) == len(BOX_a)
+                # if "History BOX QA" in value1:
+                #     BOX_q = value1['History BOX QA']['q']
+                #     BOX_a = value1['History BOX QA']['a']
+                #     assert len(BOX_q) == len(BOX_a)
+                # if "Future BOX QA" in value1:
+                #     BOX_q = value1['Future BOX QA']['q']
+                #     BOX_a = value1['Future BOX QA']['a']
+                #     assert len(BOX_q) == len(BOX_a)
+                # if "Planning" in value1:
+                #     BOX_q = value1['Planning']['q']
+                #     BOX_a = value1['Planning']['a']
+                #     assert len(BOX_q) == len(BOX_a)
+
+                if ann_type in value1:
+                    BOX_q = value1[ann_type]['q']
+                    BOX_a = value1[ann_type]['a']
+                    assert len(BOX_q) == len(BOX_a)
+
+                #######################
+                else:
+                    BOX_q = []
+                    BOX_a = []
+                    
+                Question = BOX_q
+                Answer = BOX_a
+
+                assert len(Question) == len(Answer)
+
+                # if self.first_img is None:
+                #     self.first_img = image_path
+
+                for idx in range(len(Question)):
+                    # reduce the decimals of questions
+                    coor1, coor2 = Question[idx].split('<c, CAM_FRONT, ')[-1].split('>')[0].split(', ')
+                    num1, num2 = round(float(coor1), 1), round(float(coor2), 1)
+                    Question[idx] = Question[idx].replace(coor1, str(num1))
+                    Question[idx] = Question[idx].replace(coor2, str(num2))
+                    Question[idx] += ", then describe the class of this object."
+
+                    x, y, z, label = Answer[idx].split(', ')
+                    x = x.split('A: ')[-1]
+                    index = round(float(x)) + self.num_threshold 
+                    vocab_1 = self.num_to_vocab[index]
+
+                    index = round(float(y)) + self.num_threshold + 100 # !!!important!!!!!
+                    vocab_2 = self.num_to_vocab[index]
+
+                    index = round(float(z)) + self.num_threshold + 300
+                    vocab_3 = self.num_to_vocab[index]
+
+                    vocab = [vocab_1, vocab_2, vocab_3]
+                    strings = 'Location: '+' '.join(vocab) + ' Label: ' + label
+
+                    self.questions.append(Question[idx])
+                    self.answers.append([strings])
+                    self.answers.append([strings] + [round(float(x)), round(float(y)), round(float(z))])
+                    # self.images.append(self.first_img)
+                    # self.tmp_imglist.append([self.first_img]*self.temporal_length)
+                    self.images.append(image_path)
+                    # self.tmp_imglist.append(tmp_image)
+                    cur_tmp_image = tmp_image[1:] + [image_path]
+                    self.tmp_imglist.append(cur_tmp_image)
+
+
+    def default_boxqa_det_track_pred(self, ann_paths):
+        annotation_det_path = "data/box_detection_train.json"
+        annotation_track = "data/tracking_train.json"
+        annotation_pred = "data/box_prediction_train.json"
+
+        self.default_boxqa(annotation_det_path, "BOX QA", 7)
+        num_anno_det = len(self.questions)
+        print("Train: the number of data_det: ", num_anno_det)
+
+        self.default_boxqa(annotation_track, "History BOX QA", 7)
+
+        # all_track_00_sec_idx = []
+        # all_track_30_sec_idx = []
+        # all_track_35_sec_idx = []
+        # for cur_idx, cur_question in enumerate(self.questions):
+        #     if '3.5 seconds' in cur_question:
+        #         all_track_35_sec_idx.append(cur_idx)
+        #     if '3.0 seconds' in cur_question:
+        #         all_track_30_sec_idx.append(cur_idx)
+        #     if '0.0 seconds' in cur_question:
+        #         all_track_00_sec_idx.append(cur_idx)
+
+        num_anno_track = len(self.questions) - num_anno_det
+        print("Train: the number of data_track: ", num_anno_track)
+
+        self.default_boxqa(annotation_pred, "Future BOX QA", 7)
+        num_anno_pred = len(self.questions) - num_anno_det - num_anno_track
+        print("Train: the number of data_pred: ", num_anno_pred)
+
+
+        all_idx = []
+        for cur_idx, cur_tmp_imglist in enumerate(self.tmp_imglist):
+            if len(cur_tmp_imglist) != 7:
+                all_idx.append(cur_idx)
+
+        # sample labels
+        random_numbers = random.sample(range(0, len(self.questions) + 1), 90)
+        self.questions = [self.questions[select_num] for select_num in random_numbers]
+        self.answers = [self.answers[select_num] for select_num in random_numbers]
+        self.images = [self.images[select_num] for select_num in random_numbers]
+        self.tmp_imglist = [self.tmp_imglist[select_num] for select_num in random_numbers]
+
+        # all_pred_00_sec_idx = []
+        # all_pred_30_sec_idx = []
+        # all_pred_35_sec_idx = []
+        # for cur_idx, cur_question in enumerate(self.questions):
+        #     if '3.5 seconds' in cur_question:
+        #         all_pred_35_sec_idx.append(cur_idx)
+        #     if '3.0 seconds' in cur_question:
+        #         all_pred_30_sec_idx.append(cur_idx)
+        #     if '0.0 seconds' in cur_question:
+        #         all_pred_00_sec_idx.append(cur_idx)
+
+
+    # def __getitem__(self, index):
+    #     # index = 0
+
+    #     # image_path = self.images[index]
+    #     # tmp_imglist = self.tmp_imglist[index]
+    #     # image = Image.open(image_path).convert("RGB")
+    #     # image = self.vis_processor(image)
+    #     # question = self.questions[index]
+    #     # question = self.text_processor(question)
+    #     # answer = self.answers[index]
+
+    #     # index = index % len(self.nusc_infos)
+    #     # scene_name = self.scene_names[index]
+    #     # scene_len = self.scene_lens[index]
+    #     # idx = np.random.randint(0, scene_len - self.return_len - self.offset + 1)
+
+    #     # image_list = []
+    #     # tmp_imglist = []
+    #     # for i in range(self.return_len + self.offset):
+    #     #     cur_index = self.idx_image_nusc_info[scene_name][idx + i]
+    #     #     cur_image = self.data_images[cur_index]
+    #     #     image_list.append(cur_image['image'])
+
+    #     #     # cur_image_path = self.images[cur_index]
+    #     #     # tmp_imglist.append(cur_image_path)
+
+    #     #     tmp_imglist.append(cur_image['file_path_'])
+
+    #     # image = np.stack(image_list, axis=0)
+    #     # image = torch.as_tensor(image)
+
+    #     image = self.data_images[index]
+    #     image = torch.as_tensor(image['image'])
+    #     tmp_imglist = self.tmp_imglist[index]
+    #     # question = self.questions[index]
+    #     # question = self.text_processor(question)
+    #     # answer = self.answers[index]   
+
+    #     tmp_image = []
+    #     for tmp_img in tmp_imglist:
+    #         tmp = Image.open(tmp_img).convert("RGB")
+    #         tmp = self.vis_processor(tmp)
+    #         tmp_image.append(tmp)
+    #     tmp_image = torch.stack(tmp_image, dim=0)
+        
+    #     return {
+    #         # "question": question,
+    #         # "answer": answer,
+    #         "image": image,
+    #         "tmp_image": tmp_image,
+    #     }
+
+    # def __getitem__(self, index):
+
+    #     image_list = []
+    #     tmp_imglist = []
+    #     cur_scene_video = self.scene_videos[index]
+    #     for i in range(self.return_len):
+    #         cur_index = cur_scene_video[i]
+    #         cur_image = self.data_images[cur_index]
+    #         image_list.append(cur_image['image'])
+    #         tmp_imglist.append(cur_image['file_path_'])
+
+    #     image = np.stack(image_list, axis=0)
+    #     image = torch.as_tensor(image)
+
+    #     tmp_image = []
+    #     for tmp_img in tmp_imglist:
+    #         tmp = Image.open(tmp_img).convert("RGB")
+    #         tmp = self.vis_processor(tmp)
+    #         tmp_image.append(tmp)
+    #     tmp_image = torch.stack(tmp_image, dim=0)
+        
+    #     return {
+    #         # "question": question,
+    #         # "answer": answer,
+    #         "image": image,
+    #         "tmp_image": tmp_image,
+    #     }
+
+
+    def __getitem__(self, index):
+        # length_is_valid = True
+        occ, meta = self.point_cloud_dataset[index]
+
+        # Apply random cropping
+        if self.random_crop and random.random() < self.non_leaky_prob[0]:
+            padding = np.pad(occ, pad_width=((0, 0), (1, 1), (1, 1), (0, 0)), mode='constant', constant_values=17)
+            # Randomly crop back to original dimensions (200, 200)
+            start_x = random.randint(0, 2)  # Because padding is 1 pixel on each side
+            start_y = random.randint(0, 2)
+            occ = padding[:, start_x:start_x+200, start_y:start_y+200, :]
+
+        # Apply random flip
+        random_flip_flag = False
+        if self.random_flip and random.random() < self.non_leaky_prob[1]:
+            random_flip_flag = True
+            occ = occ[:, :, ::-1, :].copy()  # Flipping the (200, 200) dimensions
+            
+        # get ego pose
+        text_tokens = []
+        for gt_pose in meta["gt_ego_poses"]:
+            x, y = gt_pose[0], gt_pose[1]
+            if random_flip_flag: 
+                x = -x
+
+            text_tokens.append([x, y])
+        text_tokens = np.array(text_tokens)
+        text_tokens = torch.as_tensor(text_tokens)
+
+        text_tokens_mask = []
+        for gt_pose_mask in meta["gt_ego_fut_masks"]:
+            text_tokens_mask.append(gt_pose_mask)
+        text_tokens_mask = np.array(text_tokens_mask)
+        text_tokens_mask = torch.as_tensor(text_tokens_mask)
+
+        occ = torch.from_numpy(occ)
+
+
+        image_list = []
+        tmp_imglist = []
+        cur_scene_video = self.scene_videos[index]
+        for i in range(self.return_len):
+            cur_index = cur_scene_video[i]
+            cur_image = self.data_images[cur_index]
+            image_list.append(cur_image['image'])
+            tmp_imglist.append(cur_image['file_path_'])
+
+        image = np.stack(image_list, axis=0)
+        image = torch.as_tensor(image)
+
+        tmp_image = []
+        for tmp_img in tmp_imglist:
+            tmp = Image.open(tmp_img).convert("RGB")
+            tmp = self.vis_processor(tmp)
+            tmp_image.append(tmp)
+        tmp_image = torch.stack(tmp_image, dim=0)
+
+        gt_ego_poses = torch.as_tensor(self.scene_videos_gt_ego_poses[index])
+        gt_ego_poses_mask = torch.as_tensor(self.scene_videos_gt_ego_poses_mask[index])
+        
+        return {
+            # "question": question,
+            # "answer": answer,
+            "image": image,
+            "tmp_image": tmp_image,
+            "gt_ego_poses": gt_ego_poses,
+            "gt_ego_poses_mask": gt_ego_poses_mask,
+
+            "input_ids": occ,
+            "labels": copy.deepcopy(occ),
+            "text_tokens": text_tokens,
+            "text_tokens_mask": text_tokens_mask,
+
+        }
+
+
+    def __len__(self):
+        # return (len(self.questions)+len(self.questions))
+        # return len(self.questions)
+        # return len(self.tmp_imglist)
+        # return len(self.nusc_infos)*self.times
+        # return len(self.scene_videos)
+        return len(self.point_cloud_dataset)
+
+    
+
+    # def collater(self, samples):
+    #     # merge samples into a list for each key
+    #     questions = [s["question"] for s in samples]
+    #     answers = [s["answer"] for s in samples]
+    #     images = [s["image"] for s in samples]
+    #     tmp_images = [s["tmp_image"] for s in samples]
+
+    #     images = torch.stack(images, dim=0)
+    #     tmp_images = torch.stack(tmp_images, dim=0)
+    #     # [][][] -> []
+    #     answers = [item[0] for item in answers]
+
+    #     return {
+    #         "images": images,
+    #         "questions": questions,
+    #         "answers": answers,
+    #         "vfeats": tmp_images,
+    #     }
+
+    def collater(self, samples):
+        # merge samples into a list for each key
+        # questions = [s["question"] for s in samples]
+        # answers = [s["answer"] for s in samples]
+        images = [s["image"] for s in samples]
+        tmp_images = [s["tmp_image"] for s in samples]
+        gt_ego_poses = [s["gt_ego_poses"] for s in samples]
+        gt_ego_poses_mask = [s["gt_ego_poses_mask"] for s in samples]
+        text_tokens = [s["text_tokens"] for s in samples]
+        text_tokens_mask = [s["text_tokens_mask"] for s in samples]
+        input_ids = [s["input_ids"] for s in samples]
+
+        images = torch.stack(images, dim=0)
+        tmp_images = torch.stack(tmp_images, dim=0)
+        gt_ego_poses = torch.stack(gt_ego_poses, dim=0)
+        gt_ego_poses_mask = torch.stack(gt_ego_poses_mask, dim=0)
+        text_tokens = torch.stack(text_tokens, dim=0)
+        input_ids = torch.stack(input_ids, dim=0)
+        text_tokens_mask = torch.stack(text_tokens_mask, dim=0)
+
+        
+        # [][][] -> []
+        # answers = [item[0] for item in answers]
+
+        return {
+            "images": images,
+            # "questions": questions,
+            # "answers": answers,
+            "vfeats": tmp_images,
+            "gt_ego_poses": gt_ego_poses,
+            "gt_ego_poses_mask": gt_ego_poses_mask,
+            "text_tokens": text_tokens,
+            "text_tokens_mask": text_tokens_mask,
+            "input_ids": input_ids,
+
+        }
+
+
+class ELMDatasetEvalDatasetVideoOcc(VQADataset, __DisplMixin):
+    def __init__(self, vis_processor=None, text_processor=None, vis_root=None, ann_paths=None):
+        """
+        vis_root (string): Root directory of images (e.g. coco/images/)
+        ann_root (string): directory to store the annotation file
+        """
+
+        occ_config = 'lavis/models/OccWorld/config/train_vqvae.py'
+        cfg = Config.fromfile(occ_config)
+
+        cfg.val_dataset_config['over_fitting'] = True
+        cfg.val_dataset_config['times'] = 1
+
+        train_dataset_occ, val_dataset_occ= get_dataset(
+            cfg.train_dataset_config,
+            cfg.val_dataset_config,
+        )
+
+        self.point_cloud_dataset = val_dataset_occ
+
+
+        self.answers = []
+        self.questions = []
+        self.images = []
+        self.first_img = None
+
+        self.vis_root = vis_root
+        self.vis_processor = vis_processor
+        self.text_processor = text_processor
+
+        self.num_to_vocab = {}
+        self.num_threshold = 30000
+
+        with open('data/vocab.txt', 'r') as file:
+            for line_number, line_content in enumerate(file, 1):
+                line_content = line_content.strip()
+                if line_number>=(self.num_threshold-1000):
+                    self.num_to_vocab[line_number] = line_content
+
+
+        # self.default_drivelm(ann_paths)
+        self.tmp_imglist = []
+        # self.temporal_length = 1
+        # self.default_boxqa(ann_paths)
+
+        # self.default_boxqa_det_track_pred(ann_paths)
+        # self.configure_traffic()
+        # self.default_traffic()
+        # self.default_drivelm()
+        # self.default_nuscenes_reconstruct()
+        # self.default_nuscenes_video()
+        # self.default_nuscenes_video_v2()
+        self.default_nuscenes_video_ego_pose()
+        # self.default_codalm()
+
+        self.data_images = ImagePaths(paths=self.images, size=256, random_crop=False)
+
+        # print("The number of data: ", len(self.questions))
+        # print("The number of data: ", len(self.tmp_imglist))
+        # print("The number of data: ", len(self.nusc_infos)*self.times)
+        # print("The number of data: ", len(self.scene_videos))
+        print("The number of data: ", len(self.point_cloud_dataset))
+
+        # self.questions.extend(self.questions)
+        # self.answers.extend(self.answers)
+        # self.images.extend(self.images)
+
+
+    # def default_drivelm(self, ann_paths):
+    def default_drivelm(self):
+        self.temporal_length = 6
+
+        # self.annotation = json.load(open(ann_paths[0], "r"))
+        # self.annotation = json.load(open('data/drivelm_val.json', "r"))
+
+        self.data_info = pickle.load(open("data/nuscenes/bevdetv2-nuscenes_infos_val.pkl", "rb"))["infos"]
+        nuscenes_info_val_reformat = {}
+        annotation_drivelm_val = json.load(open('data/drivelm_v11_nus/v1_1_val_nus_q_only.json', "r"))
+        annotation_drivelm_val_reformat = {}
+
+        for cur_nuscenes_info in self.data_info:
+            if cur_nuscenes_info['scene_token'] not in nuscenes_info_val_reformat:
+                nuscenes_info_val_reformat[cur_nuscenes_info['scene_token']] = {}
+            if cur_nuscenes_info['token'] not in nuscenes_info_val_reformat[cur_nuscenes_info['scene_token']]:
+                nuscenes_info_val_reformat[cur_nuscenes_info['scene_token']][cur_nuscenes_info['token']] = {}
+            nuscenes_info_val_reformat[cur_nuscenes_info['scene_token']][cur_nuscenes_info['token']]['timestamp'] = str(cur_nuscenes_info['cams']['CAM_FRONT']['timestamp'])
+
+        for cur_key, cur_value in annotation_drivelm_val.items():
+            annotation_drivelm_val_reformat[cur_key] = {}
+            annotation_drivelm_val_reformat[cur_key]['key_frame'] = {}
+            for cur_key_frame_key, cur_key_frame_value in cur_value['key_frames'].items():
+                cur_timestamp = nuscenes_info_val_reformat[cur_key][cur_key_frame_key]['timestamp']
+                annotation_drivelm_val_reformat[cur_key]['key_frame'][cur_timestamp] = {}
+                annotation_drivelm_val_reformat[cur_key]['key_frame'][cur_timestamp]['Perception'] = {}
+                annotation_drivelm_val_reformat[cur_key]['key_frame'][cur_timestamp]['Prediction and Planning'] = {}
+                q_perception_list, a_perception_list, q_pred_list, a_pred_list, q_plan_list, a_plan_list = [], [], [], [], [], []
+                
+                q_behavior_list, a_behavior_list = [], []
+                
+                for cur_qa_perception in cur_key_frame_value['QA']['perception']:
+                    q_perception_list.append(cur_qa_perception['Q'])
+                    a_perception_list.append(cur_qa_perception['A'])
+                for cur_qa_pred in cur_key_frame_value['QA']['prediction']:
+                    q_pred_list.append(cur_qa_pred['Q'])
+                    a_pred_list.append(cur_qa_pred['A'])
+                for cur_qa_plan in cur_key_frame_value['QA']['planning']:
+                    q_plan_list.append(cur_qa_plan['Q'])
+                    a_plan_list.append(cur_qa_plan['A'])
+
+                for cur_qa_behavior in cur_key_frame_value['QA']['behavior']:
+                    q_behavior_list.append(cur_qa_behavior['Q'])
+                    a_behavior_list.append(cur_qa_behavior['A'])
+
+                q_pred_plan_list = q_pred_list + q_plan_list
+                a_pred_plan_list = a_pred_list + a_plan_list
+
+                # q_pred_plan_list = q_pred_list + q_plan_list + q_behavior_list
+                # a_pred_plan_list = a_pred_list + a_plan_list + a_behavior_list
+
+                annotation_drivelm_val_reformat[cur_key]['key_frame'][cur_timestamp]['Perception']['q'] = q_perception_list
+                annotation_drivelm_val_reformat[cur_key]['key_frame'][cur_timestamp]['Perception']['a'] = a_perception_list
+                annotation_drivelm_val_reformat[cur_key]['key_frame'][cur_timestamp]['Prediction and Planning']['q'] = q_pred_plan_list
+                annotation_drivelm_val_reformat[cur_key]['key_frame'][cur_timestamp]['Prediction and Planning']['a'] = a_pred_plan_list
+
+        self.annotation = annotation_drivelm_val_reformat
+
+        # self.data_info = pickle.load(open("data/nuscenes/bevdetv2-nuscenes_infos_val.pkl", "rb"))["infos"]
+        for idx, info in enumerate(self.data_info):
+            scene_token = info['scene_token']
+            timestamp = info['cams']['CAM_FRONT']['timestamp']
+            image_path = info['cams']["CAM_FRONT"]['data_path']
+
+            if scene_token not in self.annotation:
+                continue
+            value = self.annotation[scene_token]
+            # scene_description = value['scene_description']
+            scene_key_frame = value['key_frame']
+            frame_id = str(timestamp)
+            if frame_id in scene_key_frame:
+                # temporal data only for image path
+                tmp_image = []
+                for tmp in range(1, self.temporal_length+1):
+                    if scene_token != self.data_info[idx-tmp]['scene_token']:
+                        continue
+                    tmp_path = self.data_info[idx-tmp]['cams']['CAM_FRONT']['data_path']
+                    tmp_image.append(tmp_path)
+
+                # if the image path is not equal self.temporal length, then use the duplicate image path
+                tmp_image = tmp_image[::-1]
+                if len(tmp_image) != self.temporal_length:
+                    if len(tmp_image) != 0:
+                        tmp_image = tmp_image[:1] * (self.temporal_length - len(tmp_image)) + tmp_image
+                    else:
+                        tmp_image = [image_path] * self.temporal_length
+                assert len(tmp_image) == self.temporal_length
+
+                value1 = scene_key_frame[frame_id]
+
+                if "Perception" in value1:
+                    Perception_q = value1['Perception']['q']
+                    Perception_a = value1['Perception']['a']
+                else:
+                    Perception_q = []
+                    Perception_a = []
+
+                if "Prediction and Planning" in value1:
+                    Prediction_q = value1['Prediction and Planning']['q']
+                    Prediction_a = value1['Prediction and Planning']['a']
+                else:
+                    Prediction_q = []
+                    Prediction_a = []
+                                    
+
+                Question = Perception_q + Prediction_q
+                Answer = Perception_a + Prediction_a
+
+            
+                assert len(Question) == len(Answer)
+
+                for idx in range(len(Question)):                
+                    self.questions.append(Question[idx])
+                    self.answers.append([Answer[idx]])
+                    self.images.append(image_path)
+                    cur_tmp_image = tmp_image + [image_path]
+                    self.tmp_imglist.append(cur_tmp_image)
+
+
+    def default_nuscenes_reconstruct(self):
+        self.temporal_length = 0
+                        
+        self.data_info = pickle.load(open("data/nuscenes/bevdetv2-nuscenes_infos_val.pkl", "rb"))["infos"]
+        for idx, info in enumerate(self.data_info):
+            scene_token = info['scene_token']
+            timestamp = info['cams']['CAM_FRONT']['timestamp']
+            image_path = info['cams']["CAM_FRONT"]['data_path']
+
+            # temporal data only for image path
+            tmp_image = []
+            for tmp in range(1, self.temporal_length+1):
+                if scene_token != self.data_info[idx-tmp]['scene_token']:
+                    continue
+                tmp_path = self.data_info[idx-tmp]['cams']['CAM_FRONT']['data_path']
+                tmp_image.append(tmp_path)
+
+            # if the image path is not equal self.temporal length, then use the duplicate image path
+            tmp_image = tmp_image[::-1]
+            if len(tmp_image) != self.temporal_length:
+                if len(tmp_image) != 0:
+                    tmp_image = tmp_image[:1] * (self.temporal_length - len(tmp_image)) + tmp_image
+                else:
+                    tmp_image = [image_path] * self.temporal_length
+            assert len(tmp_image) == self.temporal_length
+
+            self.images.append(image_path)
+            cur_tmp_image = tmp_image + [image_path]
+            self.tmp_imglist.append(cur_tmp_image)
+
+
+    def default_nuscenes_video(self):
+        imageset = "data/nuscenes/nuscenes_infos_val_temporal_v3_scene.pkl"
+        with open(imageset, 'rb') as f:
+            data = pickle.load(f)
+        
+        self.nusc_infos = data['infos']
+        self.scene_names = list(self.nusc_infos.keys())   
+
+        self.scene_lens = [len(self.nusc_infos[sn]) for sn in self.scene_names]
+        self.return_len = 6
+        self.offset = 0        
+        self.times = 20
+
+        idx_image = 0
+        self.idx_image_nusc_info = {}
+        for cur_scene_name in self.scene_names:
+            self.idx_image_nusc_info[cur_scene_name] = []
+            for cur_info in self.nusc_infos[cur_scene_name]:
+                image_path = cur_info['cams']['CAM_FRONT']['data_path']
+                self.images.append(image_path)
+                self.idx_image_nusc_info[cur_scene_name].append(idx_image)
+                idx_image = idx_image + 1
+
+
+    def default_nuscenes_video_v2(self):
+        imageset = "data/nuscenes/nuscenes_infos_val_temporal_v3_scene.pkl"
+        with open(imageset, 'rb') as f:
+            data = pickle.load(f)
+        
+        self.nusc_infos = data['infos']
+        self.scene_names = list(self.nusc_infos.keys())   
+
+        self.scene_lens = [len(self.nusc_infos[sn]) for sn in self.scene_names]
+        self.return_len = 6
+        self.offset = 0        
+        self.times = 20
+
+        idx_image = 0
+        self.idx_image_nusc_info = {}
+
+        self.scene_videos = []
+
+        for cur_scene_name in self.scene_names:
+            self.idx_image_nusc_info[cur_scene_name] = []
+            for cur_info in self.nusc_infos[cur_scene_name]:
+                image_path = cur_info['cams']['CAM_FRONT']['data_path']
+                self.images.append(image_path)
+                self.idx_image_nusc_info[cur_scene_name].append(idx_image)
+                idx_image = idx_image + 1
+
+            cur_scene_len = len(self.nusc_infos[cur_scene_name])
+            if cur_scene_len >= self.return_len:
+                for start_idx in range(cur_scene_len - self.return_len +1):
+                    self.scene_videos.append(self.idx_image_nusc_info[cur_scene_name][start_idx:start_idx+self.return_len])
+
+
+    def default_nuscenes_video_ego_pose(self):
+        imageset = "data/nuscenes/nuscenes_infos_val_temporal_v3_scene.pkl"
+        with open(imageset, 'rb') as f:
+            data = pickle.load(f)
+        
+        self.nusc_infos = data['infos']
+        self.scene_names = list(self.nusc_infos.keys())   
+
+        self.scene_lens = [len(self.nusc_infos[sn]) for sn in self.scene_names]
+        self.return_len = 6
+        self.offset = 0        
+        self.times = 20
+
+        idx_image = 0
+        self.idx_image_nusc_info = {}
+        self.gt_ego_poses = {}
+        self.gt_ego_poses_mask = {}
+
+        self.scene_videos = []
+        self.scene_videos_gt_ego_poses = []
+        self.scene_videos_gt_ego_poses_mask = []
+
+        for cur_scene_name in self.scene_names:
+            self.idx_image_nusc_info[cur_scene_name] = []
+            self.gt_ego_poses[cur_scene_name] = []
+            self.gt_ego_poses_mask[cur_scene_name] = []
+
+            for cur_info_idx, cur_info in enumerate(self.nusc_infos[cur_scene_name]):
+                # if cur_info_idx == 0:
+                #     self.gt_ego_poses[cur_scene_name].append(cur_info['gt_ego_his_trajs'][-1])
+
+                image_path = cur_info['cams']['CAM_FRONT']['data_path']
+                self.images.append(image_path)
+                self.idx_image_nusc_info[cur_scene_name].append(idx_image)
+                self.gt_ego_poses[cur_scene_name].append(cur_info['gt_ego_fut_trajs'][0])
+                self.gt_ego_poses_mask[cur_scene_name].append(cur_info['gt_ego_fut_masks'][0])
+
+                idx_image = idx_image + 1
+
+            cur_scene_len = len(self.nusc_infos[cur_scene_name])
+            if cur_scene_len >= self.return_len:
+                for start_idx in range(cur_scene_len - self.return_len + 1):
+                    self.scene_videos.append(self.idx_image_nusc_info[cur_scene_name][start_idx:start_idx+self.return_len])
+                    self.scene_videos_gt_ego_poses.append(self.gt_ego_poses[cur_scene_name][start_idx:start_idx+self.return_len])
+                    self.scene_videos_gt_ego_poses_mask.append(self.gt_ego_poses_mask[cur_scene_name][start_idx:start_idx+self.return_len])
+
+        self.scene_videos_gt_ego_poses = np.array(self.scene_videos_gt_ego_poses)
+        self.scene_videos_gt_ego_poses_mask = np.array(self.scene_videos_gt_ego_poses_mask)
+
+
+    def default_ego4d(self):
+        data_path = "data/ego4d/v2/nlq_official_v2_omnivore_video_fp16_official_128_bert.pkl"
+        data = load_pickle(data_path)
+        self.train_data = data["val_set"]
+
+        # process answers
+        narration_file_path = "data/ego4d/v2/annotations/narration.json"
+        narration_data = load_json_file(narration_file_path)
+
+        nlq_file_path = "data/ego4d/v2/annotations/nlq_val.json"
+        nlq_data = load_json_file(nlq_file_path)
+
+        video_clip_dict = {}
+        clip_id_list = []
+
+        for video in nlq_data["videos"]:
+            video_uid = video['video_uid']
+            for clip in video['clips']:
+                clip_uid = clip['clip_uid']
+                clip_s_time = clip['video_start_sec']
+                clip_e_time = clip['video_end_sec']
+                video_clip_dict[clip_uid] = [video_uid, clip_s_time, clip_e_time]
+        
+        for i in tqdm.tqdm(range(len(self.train_data))):
+            record = self.train_data[i]
+            
+            clip_id, start_time, end_time = record["vid"], record["s_time"], record["e_time"]
+            s_ind, e_ind = record["s_ind"], record["e_ind"]
+            question = record["query"]
+            video_id = video_clip_dict[clip_id][0]
+            clip_s_time, clip_e_time = video_clip_dict[clip_id][1], video_clip_dict[clip_id][2]
+            video_clip = narration_data[video_id]
+            if clip_id in clip_id_list:
+                continue
+            else:
+                clip_id_list.append(clip_id)
+
+            narrations = []
+            if "narration_pass_1" in video_clip:
+                narrations += video_clip["narration_pass_1"]["narrations"]
+            if "narration_pass_2" in video_clip:
+                narrations += video_clip["narration_pass_2"]["narrations"]
+            for narration in narrations:
+                timestamp = narration['timestamp_sec']-clip_s_time
+                timestamp_frame = narration['timestamp_frame']
+                # assert timestamp>=0
+                if timestamp>=0 and timestamp<=480:
+                    img_path = get_img_frames(clip_id, timestamp_frame)
+                    if img_path is not None:
+                        self.questions.append("Give a caption.")
+                        self.answers.append([narration['narration_text'][3:]])
+                        self.images.append(img_path)
+
+    def default_boxqa(self, ann_paths, ann_type, temporal_length):
+        # self.annotation = json.load(open("data/box_detection_val.json", "r"))
+        # self.annotation = json.load(open("data/tracking_val.json", "r"))
+        # self.annotation = json.load(open("data/box_prediction_val.json", "r"))
+        # self.annotation = json.load(open("data/planning_val.json", "r"))
+
+        self.annotation = json.load(open(ann_paths, "r"))
+
+        # first_key, first_value = next(iter(self.annotation.items()))
+        # self.annotation = {}
+        # self.annotation[first_key] = first_value
+
+        self.temporal_length = temporal_length
+        
+        self.data_info = pickle.load(open("data/nuscenes/bevdetv2-nuscenes_infos_trainval.pkl", "rb"))["infos"]
+        for idx, info in enumerate(self.data_info):
+            scene_token = info['scene_token']
+            timestamp = info['cams']['CAM_FRONT']['timestamp']
+            image_path = info['cams']["CAM_FRONT"]['data_path']
+
+            if scene_token not in self.annotation:
+                continue
+            value = self.annotation[scene_token]
+            # scene_description = value['scene_description']
+            scene_key_frame = value['key_frame']
+            frame_id = str(timestamp)
+            if frame_id in scene_key_frame:
+
+                # temporal data only for image path
+                tmp_image = []
+                for tmp in range(1, self.temporal_length+1):
+                    if scene_token != self.data_info[idx-tmp]['scene_token']:
+                        continue
+                    tmp_path = self.data_info[idx-tmp]['cams']['CAM_FRONT']['data_path']
+                    tmp_image.append(tmp_path)
+
+                # if the image path is not equal self.temporal length, then use the duplicate image path
+                tmp_image = tmp_image[::-1]
+                if len(tmp_image) != self.temporal_length:
+                    if len(tmp_image) != 0:
+                        tmp_image = tmp_image[:1] * (self.temporal_length - len(tmp_image)) + tmp_image
+                    else:
+                        tmp_image = [image_path] * self.temporal_length
+                assert len(tmp_image) == self.temporal_length
+
+                value1 = scene_key_frame[frame_id]
+
+                if value1 is None:
+                    continue
+
+                ####################### 
+                # if "BOX QA" in value1:
+                #     BOX_q = value1['BOX QA']['q']
+                #     BOX_a = value1['BOX QA']['a']
+                #     assert len(BOX_q) == len(BOX_a)
+                # if "History BOX QA" in value1:
+                #     BOX_q = value1['History BOX QA']['q']
+                #     BOX_a = value1['History BOX QA']['a']
+                #     assert len(BOX_q) == len(BOX_a)
+                # if "Future BOX QA" in value1:
+                #     BOX_q = value1['Future BOX QA']['q']
+                #     BOX_a = value1['Future BOX QA']['a']
+                #     assert len(BOX_q) == len(BOX_a)
+                # if "Planning" in value1:
+                #     BOX_q = value1['Planning']['q']
+                #     BOX_a = value1['Planning']['a']
+                #     assert len(BOX_q) == len(BOX_a)
+                #######################
+                if ann_type in value1:
+                    BOX_q = value1[ann_type]['q']
+                    BOX_a = value1[ann_type]['a']
+                    assert len(BOX_q) == len(BOX_a)
+                else:
+                    BOX_q = []
+                    BOX_a = []
+                    
+                Question = BOX_q
+                Answer = BOX_a
+
+                assert len(Question) == len(Answer)
+
+                # if self.first_img is None:
+                #     self.first_img = image_path
+                    
+                for idx in range(len(Question)):
+                    # reduce the decimals of questions
+                    coor1, coor2 = Question[idx].split('<c, CAM_FRONT, ')[-1].split('>')[0].split(', ')
+                    num1, num2 = round(float(coor1), 1), round(float(coor2), 1)
+                    Question[idx] = Question[idx].replace(coor1, str(num1))
+                    Question[idx] = Question[idx].replace(coor2, str(num2))
+                    Question[idx] += ", then describe the class of this object."
+
+                    x, y, z, label = Answer[idx].split(', ')
+                    x = x.split('A: ')[-1]
+                    index = round(float(x)) + self.num_threshold 
+                    vocab_1 = self.num_to_vocab[index]
+
+                    index = round(float(y)) + self.num_threshold + 100 # !!!important!!!!!
+                    vocab_2 = self.num_to_vocab[index]
+
+                    index = round(float(z)) + self.num_threshold + 300
+                    vocab_3 = self.num_to_vocab[index]
+
+                    vocab = [vocab_1, vocab_2, vocab_3]
+                    strings = 'Location: '+' '.join(vocab) + ' Label: ' + label
+
+                    self.questions.append(Question[idx])
+                    self.answers.append([strings])
+                    # self.images.append(self.first_img)
+                    # self.tmp_imglist.append([self.first_img]*self.temporal_length)
+                    self.images.append(image_path)
+                    # self.tmp_imglist.append(tmp_image)
+                    cur_tmp_image = tmp_image[1:] + [image_path]
+                    self.tmp_imglist.append(cur_tmp_image)
+
+    def configure_traffic(self):
+        data_root = 'data/openlane_v2_nus'
+        with open(data_root + '/data_dict_subset_B_val.pkl', 'rb') as f:
+            data_infos = pickle.load(f)
+        
+        data_infos = list(data_infos.values())
+        
+        # data_infos = random.sample(data_infos, 20)
+
+        nuscenes_info = pickle.load(open("data/nuscenes/bevdetv2-nuscenes_infos_train.pkl", "rb"))["infos"]
+        self.traffic_element_dict = {}
+        for cur_nuscenes_info in nuscenes_info:
+            self.traffic_element_dict[cur_nuscenes_info['scene_token']] = {}
+
+        num=0
+        
+        for info in tqdm.tqdm(data_infos):
+            ann_info = info['annotation']
+            timestamp = info['timestamp']
+            scene_id = info['meta_data']['source_id']
+
+            if scene_id not in self.traffic_element_dict.keys():
+                self.traffic_element_dict[scene_id] = {}
+
+            gt_lanes = [np.array(lane['points'], dtype=np.float32) for lane in ann_info['lane_centerline']]
+            te_bboxes = np.array([np.array(sign['points'], dtype=np.float32).flatten() for sign in ann_info['traffic_element']])
+            if len(te_bboxes) == 0:
+                te_bboxes = np.zeros((0, 4), dtype=np.float32)
+
+            distance = []
+            for i in range(len(gt_lanes)):
+                distance.append((sum(sum(np.array(gt_lanes[i])**2))**0.5)/len(gt_lanes[i]))
+            te_list = []
+            for i in range(len(ann_info['traffic_element'])):
+                te_ann = ann_info['traffic_element'][i]
+                attribute = te_ann['attribute']
+                if attribute>=4:
+                    num+=1
+                    te_list.append(attribute)
+            
+            self.traffic_element_dict[scene_id][timestamp] = te_list
+        print("The number of total traffic elements: ", num)
+
+
+    def default_traffic(self):
+        self.te_convert = {
+            0:  'unknown',
+            1:  'red',
+            2:  'green',
+            3:  'yellow',
+            4:  'go_straight',
+            5:  'turn_left',
+            6:  'turn_right',
+            7:  'no_left_turn',
+            8:  'no_right_turn',
+            9:  'u_turn',
+            10: 'no_u_turn',
+            11: 'slight_left',
+            12: 'slight_right',
+        }
+
+        self.temporal_length = 6
+        self.data_info = pickle.load(open("data/nuscenes/bevdetv2-nuscenes_infos_trainval.pkl", "rb"))["infos"]
+        
+        neg_num = 0
+        pos_num = 0
+        for idx, info in enumerate(self.data_info):
+            scene_token = info['scene_token']
+            timestamp = info['cams']['CAM_FRONT']['timestamp']
+            image_path = info['cams']["CAM_FRONT"]['data_path']
+            if scene_token not in self.traffic_element_dict:
+                continue   
+            value = self.traffic_element_dict[scene_token]
+            if timestamp in value:
+                # temporal data only for image path
+                tmp_image = []
+                history_te = [self.traffic_element_dict[scene_token][timestamp]]
+                for tmp in range(1, self.temporal_length+1):
+                    if scene_token != self.data_info[idx-tmp]['scene_token']:
+                        continue
+                    tmp_path = self.data_info[idx-tmp]['cams']['CAM_FRONT']['data_path']
+                    tmp_image.append(tmp_path)
+
+                    timestamp = self.data_info[idx-tmp]['cams']['CAM_FRONT']['timestamp']
+                    scene_id = self.data_info[idx-tmp]['scene_token']
+                    if scene_id not in self.traffic_element_dict.keys():
+                        continue
+                    if timestamp not in self.traffic_element_dict[scene_id].keys():
+                        continue
+                    history_te.append(self.traffic_element_dict[scene_id][timestamp])
+
+                # if the image path is not equal self.temporal length, then use the duplicate image path
+                tmp_image = tmp_image[::-1]
+                if len(tmp_image) != self.temporal_length:
+                    if len(tmp_image) != 0:
+                        tmp_image = tmp_image[:1] * (self.temporal_length - len(tmp_image)) + tmp_image
+                    else:
+                        tmp_image = [image_path] * self.temporal_length
+                assert len(tmp_image) == self.temporal_length
+
+                # get the traffic element 
+                longest_list = max(history_te, key=len)
+                element_counts = {}
+                for element in longest_list:
+                    if element in element_counts:
+                        element_counts[element] += 1
+                    else:
+                        element_counts[element] = 1
+
+                length = len(element_counts)
+                Traffic_q = 'Has the ego vehicle seen any traffic sign before?'
+                if length==0:
+                    Traffic_a = 'No. There is no traffic sign in the scene.'
+                if length==1:
+                    Traffic_a = f'Yes. The ego vehicle has seen {element_counts[longest_list[0]]} {self.te_convert[longest_list[0]]} before.'
+                if length==2:
+                    Traffic_a = f'Yes. The ego vehicle has seen {element_counts[longest_list[0]]} {self.te_convert[longest_list[0]]} and {element_counts[longest_list[1]]} {self.te_convert[longest_list[1]]} before.'
+                if length==3:
+                    Traffic_a = f'Yes. The ego vehicle has seen {element_counts[longest_list[0]]} {self.te_convert[longest_list[0]]}, {element_counts[longest_list[1]]} {self.te_convert[longest_list[1]]} and {element_counts[longest_list[2]]} {self.te_convert[longest_list[2]]} before.'
+                if length==4:
+                    Traffic_a = f'Yes. The ego vehicle has seen {element_counts[longest_list[0]]} {self.te_convert[longest_list[0]]}, {element_counts[longest_list[1]]} {self.te_convert[longest_list[1]]}, {element_counts[longest_list[2]]} {self.te_convert[longest_list[2]]} and {element_counts[longest_list[3]]} {self.te_convert[longest_list[3]]} before.'
+                if length==5:
+                    Traffic_a = f'Yes. The ego vehicle has seen {element_counts[longest_list[0]]} {self.te_convert[longest_list[0]]}, {element_counts[longest_list[1]]} {self.te_convert[longest_list[1]]}, {element_counts[longest_list[2]]} {self.te_convert[longest_list[2]]}, {element_counts[longest_list[3]]} {self.te_convert[longest_list[3]]} and {element_counts[longest_list[4]]} {self.te_convert[longest_list[4]]} before.'
+                if length==6:
+                    Traffic_a = f'Yes. The ego vehicle has seen {element_counts[longest_list[0]]} {self.te_convert[longest_list[0]]}, {element_counts[longest_list[1]]} {self.te_convert[longest_list[1]]}, {element_counts[longest_list[2]]} {self.te_convert[longest_list[2]]}, {element_counts[longest_list[3]]} {self.te_convert[longest_list[3]]}, {element_counts[longest_list[4]]} {self.te_convert[longest_list[4]]} and {element_counts[longest_list[5]]} {self.te_convert[longest_list[5]]} before.'
+                if length==7:
+                    Traffic_a = f'Yes. The ego vehicle has seen {element_counts[longest_list[0]]} {self.te_convert[longest_list[0]]}, {element_counts[longest_list[1]]} {self.te_convert[longest_list[1]]}, {element_counts[longest_list[2]]} {self.te_convert[longest_list[2]]}, {element_counts[longest_list[3]]} {self.te_convert[longest_list[3]]}, {element_counts[longest_list[4]]} {self.te_convert[longest_list[4]]}, {element_counts[longest_list[5]]} {self.te_convert[longest_list[5]]} and {element_counts[longest_list[6]]} {self.te_convert[longest_list[6]]} before.'
+                if length==8:
+                    Traffic_a = f'Yes. The ego vehicle has seen {element_counts[longest_list[0]]} {self.te_convert[longest_list[0]]}, {element_counts[longest_list[1]]} {self.te_convert[longest_list[1]]}, {element_counts[longest_list[2]]} {self.te_convert[longest_list[2]]}, {element_counts[longest_list[3]]} {self.te_convert[longest_list[3]]}, {element_counts[longest_list[4]]} {self.te_convert[longest_list[4]]}, {element_counts[longest_list[5]]} {self.te_convert[longest_list[5]]}, {element_counts[longest_list[6]]} {self.te_convert[longest_list[6]]} and {element_counts[longest_list[7]]} {self.te_convert[longest_list[7]]} before.'
+                if length==9:
+                    Traffic_a = f'Yes. The ego vehicle has seen {element_counts[longest_list[0]]} {self.te_convert[longest_list[0]]}, {element_counts[longest_list[1]]} {self.te_convert[longest_list[1]]}, {element_counts[longest_list[2]]} {self.te_convert[longest_list[2]]}, {element_counts[longest_list[3]]} {self.te_convert[longest_list[3]]}, {element_counts[longest_list[4]]} {self.te_convert[longest_list[4]]}, {element_counts[longest_list[5]]} {self.te_convert[longest_list[5]]}, {element_counts[longest_list[6]]} {self.te_convert[longest_list[6]]}, {element_counts[longest_list[7]]} {self.te_convert[longest_list[7]]} and {element_counts[longest_list[8]]} {self.te_convert[longest_list[8]]} before.'
+                if length==10:
+                    Traffic_a = f'Yes. The ego vehicle has seen {element_counts[longest_list[0]]} {self.te_convert[longest_list[0]]}, {element_counts[longest_list[1]]} {self.te_convert[longest_list[1]]}, {element_counts[longest_list[2]]} {self.te_convert[longest_list[2]]}, {element_counts[longest_list[3]]} {self.te_convert[longest_list[3]]}, {element_counts[longest_list[4]]} {self.te_convert[longest_list[4]]}, {element_counts[longest_list[5]]} {self.te_convert[longest_list[5]]}, {element_counts[longest_list[6]]} {self.te_convert[longest_list[6]]}, {element_counts[longest_list[7]]} {self.te_convert[longest_list[7]]}, {element_counts[longest_list[8]]} {self.te_convert[longest_list[8]]} and {element_counts[longest_list[9]]} {self.te_convert[longest_list[9]]} before.'
+                if length==11:
+                    Traffic_a = f'Yes. The ego vehicle has seen {element_counts[longest_list[0]]} {self.te_convert[longest_list[0]]}, {element_counts[longest_list[1]]} {self.te_convert[longest_list[1]]}, {element_counts[longest_list[2]]} {self.te_convert[longest_list[2]]}, {element_counts[longest_list[3]]} {self.te_convert[longest_list[3]]}, {element_counts[longest_list[4]]} {self.te_convert[longest_list[4]]}, {element_counts[longest_list[5]]} {self.te_convert[longest_list[5]]}, {element_counts[longest_list[6]]} {self.te_convert[longest_list[6]]}, {element_counts[longest_list[7]]} {self.te_convert[longest_list[7]]}, {element_counts[longest_list[8]]} {self.te_convert[longest_list[8]]}, {element_counts[longest_list[9]]} {self.te_convert[longest_list[9]]} and {element_counts[longest_list[10]]} {self.te_convert[longest_list[10]]} before.'
+                if length==12:
+                    Traffic_a = f'Yes. The ego vehicle has seen {element_counts[longest_list[0]]} {self.te_convert[longest_list[0]]}, {element_counts[longest_list[1]]} {self.te_convert[longest_list[1]]}, {element_counts[longest_list[2]]} {self.te_convert[longest_list[2]]}, {element_counts[longest_list[3]]} {self.te_convert[longest_list[3]]}, {element_counts[longest_list[4]]} {self.te_convert[longest_list[4]]}, {element_counts[longest_list[5]]} {self.te_convert[longest_list[5]]}, {element_counts[longest_list[6]]} {self.te_convert[longest_list[6]]}, {element_counts[longest_list[7]]} {self.te_convert[longest_list[7]]}, {element_counts[longest_list[8]]} {self.te_convert[longest_list[8]]}, {element_counts[longest_list[9]]} {self.te_convert[longest_list[9]]}, {element_counts[longest_list[10]]} {self.te_convert[longest_list[10]]} and {element_counts[longest_list[11]]} {self.te_convert[longest_list[11]]} before.'
+                if length==13:
+                    Traffic_a = f'Yes. The ego vehicle has seen {element_counts[longest_list[0]]} {self.te_convert[longest_list[0]]}, {element_counts[longest_list[1]]} {self.te_convert[longest_list[1]]}, {element_counts[longest_list[2]]} {self.te_convert[longest_list[2]]}, {element_counts[longest_list[3]]} {self.te_convert[longest_list[3]]}, {element_counts[longest_list[4]]} {self.te_convert[longest_list[4]]}, {element_counts[longest_list[5]]} {self.te_convert[longest_list[5]]}, {element_counts[longest_list[6]]} {self.te_convert[longest_list[6]]}, {element_counts[longest_list[7]]} {self.te_convert[longest_list[7]]}, {element_counts[longest_list[8]]} {self.te_convert[longest_list[8]]}, {element_counts[longest_list[9]]} {self.te_convert[longest_list[9]]}, {element_counts[longest_list[10]]} {self.te_convert[longest_list[10]]}, {element_counts[longest_list[11]]} {self.te_convert[longest_list[11]]} and {element_counts[longest_list[12]]} {self.te_convert[longest_list[12]]} before.'
+                if length==14:
+                    Traffic_a = f'Yes. The ego vehicle has seen {element_counts[longest_list[0]]} {self.te_convert[longest_list[0]]}, {element_counts[longest_list[1]]} {self.te_convert[longest_list[1]]}, {element_counts[longest_list[2]]} {self.te_convert[longest_list[2]]}, {element_counts[longest_list[3]]} {self.te_convert[longest_list[3]]}, {element_counts[longest_list[4]]} {self.te_convert[longest_list[4]]}, {element_counts[longest_list[5]]} {self.te_convert[longest_list[5]]}, {element_counts[longest_list[6]]} {self.te_convert[longest_list[6]]}, {element_counts[longest_list[7]]} {self.te_convert[longest_list[7]]}, {element_counts[longest_list[8]]} {self.te_convert[longest_list[8]]}, {element_counts[longest_list[9]]} {self.te_convert[longest_list[9]]}, {element_counts[longest_list[10]]} {self.te_convert[longest_list[10]]}, {element_counts[longest_list[11]]} {self.te_convert[longest_list[11]]}, {element_counts[longest_list[12]]} {self.te_convert[longest_list[12]]} and {element_counts[longest_list[13]]} {self.te_convert[longest_list[13]]} before.'
+                if length==15:
+                    Traffic_a = f'Yes. The ego vehicle has seen {element_counts[longest_list[0]]} {self.te_convert[longest_list[0]]}, {element_counts[longest_list[1]]} {self.te_convert[longest_list[1]]}, {element_counts[longest_list[2]]} {self.te_convert[longest_list[2]]}, {element_counts[longest_list[3]]} {self.te_convert[longest_list[3]]}, {element_counts[longest_list[4]]} {self.te_convert[longest_list[4]]}, {element_counts[longest_list[5]]} {self.te_convert[longest_list[5]]}, {element_counts[longest_list[6]]} {self.te_convert[longest_list[6]]}, {element_counts[longest_list[7]]} {self.te_convert[longest_list[7]]}, {element_counts[longest_list[8]]} {self.te_convert[longest_list[8]]}, {element_counts[longest_list[9]]} {self.te_convert[longest_list[9]]}, {element_counts[longest_list[10]]} {self.te_convert[longest_list[10]]}, {element_counts[longest_list[11]]} {self.te_convert[longest_list[11]]}, {element_counts[longest_list[12]]} {self.te_convert[longest_list[12]]}, {element_counts[longest_list[13]]} {self.te_convert[longest_list[13]]} and {element_counts[longest_list[14]]} {self.te_convert[longest_list[14]]} before.'
+
+                if (length == 0 and idx % 3 == 0) or (length != 0):
+                    if length == 0:
+                        neg_num += 1
+                    else:
+                        pos_num += 1
+                    self.images.append(image_path)
+                    cur_tmp_image = tmp_image + [image_path]
+                    self.tmp_imglist.append(cur_tmp_image)
+                    self.questions.append(Traffic_q)
+                    self.answers.append([Traffic_a])
+        
+        print("The number of traffic questions: ", len(self.questions))
+        print("The number of positive questions: ", pos_num)
+        print("The number of negative questions: ", neg_num)
+
+
+    def default_boxqa_det_track_pred(self, ann_paths):
+        annotation_det_path = "data/box_detection_val.json"
+        annotation_track = "data/tracking_val.json"
+        annotation_pred = "data/box_prediction_val.json"
+
+        self.default_boxqa(annotation_det_path, "BOX QA", 7)
+        num_anno_det = len(self.questions)
+        print("Val: the number of data_det: ", num_anno_det)
+
+        self.default_boxqa(annotation_track, "History BOX QA", 7)
+        
+        # all_track_00_sec_idx = []
+        # all_track_30_sec_idx = []
+        # all_track_35_sec_idx = []
+        # for cur_idx, cur_question in enumerate(self.questions):
+        #     if '3.5 seconds' in cur_question:
+        #         all_track_35_sec_idx.append(cur_idx)
+        #     if '3.0 seconds' in cur_question:
+        #         all_track_30_sec_idx.append(cur_idx)
+        #     if '0.0 seconds' in cur_question:
+        #         all_track_00_sec_idx.append(cur_idx)
+        
+        num_anno_track = len(self.questions) - num_anno_det
+        print("Val: the number of data_track: ", num_anno_track)
+        
+        self.default_boxqa(annotation_pred, "Future BOX QA", 7)
+
+        # all_pred_00_sec_idx = []
+        # all_pred_30_sec_idx = []
+        # all_pred_35_sec_idx = []
+        # for cur_idx, cur_question in enumerate(self.questions):
+        #     if '3.5 seconds' in cur_question:
+        #         all_pred_35_sec_idx.append(cur_idx)
+        #     if '3.0 seconds' in cur_question:
+        #         all_pred_30_sec_idx.append(cur_idx)
+        #     if '0.0 seconds' in cur_question:
+        #         all_pred_00_sec_idx.append(cur_idx)
+
+        num_anno_pred = len(self.questions) - num_anno_det - num_anno_track
+        print("Val: the number of data_pred: ", num_anno_pred)
+
+        # all_idx = []
+        # for cur_idx, cur_tmp_imglist in enumerate(self.tmp_imglist):
+        #     if len(cur_tmp_imglist) != 7:
+        #         all_idx.append(cur_idx)
+
+        # sample labels
+        # random_numbers = random.sample(range(0, len(self.questions) + 1), 20)
+        # self.questions = [self.questions[select_num] for select_num in random_numbers]
+        # self.answers = [self.answers[select_num] for select_num in random_numbers]
+        # self.images = [self.images[select_num] for select_num in random_numbers]
+        # self.tmp_imglist = [self.tmp_imglist[select_num] for select_num in random_numbers]
+
+    def default_codalm(self):                        
+        # self.data_info_general_perception = codalm_load_json_file('/harddisk/yzhu/CODA-LM/data/CODA-LM/Train/vqa_anno/general_perception.jsonl')
+        # self.data_info_region_perception = codalm_load_json_file('/harddisk/yzhu/CODA-LM/data/CODA-LM/Train/vqa_anno/region_perception.jsonl')
+        # self.data_info_driving_suggestion = codalm_load_json_file('/harddisk/yzhu/CODA-LM/data/CODA-LM/Train/vqa_anno/driving_suggestion.jsonl')
+
+        self.data_info = codalm_load_json_file('/harddisk/yzhu/CODA-LM/data/CODA-LM/Val/vqa_anno/general_perception.jsonl')
+        
+        # self.data_info = random.sample(self.data_info, 100)
+
+        for idx, info in enumerate(self.data_info):
+            cur_image_path = '/harddisk/yzhu/CODA-LM/data/' + info['image']
+
+            self.questions.append(info['question'])
+            self.answers.append([info['answer']])
+            self.images.append(cur_image_path)
+            self.tmp_imglist.append([cur_image_path])
+
+
+    # def __getitem__(self, index):
+    #     # index = 0
+
+    #     # image_path = self.images[index]
+    #     # tmp_imglist = self.tmp_imglist[index]
+    #     # image = Image.open(image_path).convert("RGB")
+    #     # image = self.vis_processor(image)
+    #     # question = self.questions[index]
+    #     # question = self.text_processor(question)
+    #     # answer = self.answers[index]
+
+    #     # index = index % len(self.nusc_infos)
+    #     # scene_name = self.scene_names[index]
+    #     # scene_len = self.scene_lens[index]
+    #     # idx = np.random.randint(0, scene_len - self.return_len - self.offset + 1)
+
+    #     # image_list = []
+    #     # tmp_imglist = []
+    #     # for i in range(self.return_len + self.offset):
+    #     #     cur_index = self.idx_image_nusc_info[scene_name][idx + i]
+    #     #     cur_image = self.data_images[cur_index]
+    #     #     image_list.append(cur_image['image'])
+
+    #     #     cur_image_path = self.images[cur_index]
+    #     #     tmp_imglist.append(cur_image_path)
+
+    #     # image = np.stack(image_list, axis=0)
+    #     # image = torch.as_tensor(image)
+
+    #     ############################
+    #     index = np.random.randint(0, len(self.tmp_imglist))
+    #     ############################
+
+    #     image = self.data_images[index]
+    #     image = torch.as_tensor(image['image'])
+    #     tmp_imglist = self.tmp_imglist[index]
+    #     # question = self.questions[index]
+    #     # question = self.text_processor(question)
+    #     # answer = self.answers[index]   
+
+    #     tmp_image = []
+    #     for tmp_img in tmp_imglist:
+    #         tmp = Image.open(tmp_img).convert("RGB")
+    #         tmp = self.vis_processor(tmp)
+    #         tmp_image.append(tmp)
+    #     tmp_image = torch.stack(tmp_image, dim=0)
+        
+    #     return {
+    #         # "question": question,
+    #         # "answer": answer,
+    #         "image": image,
+    #         "tmp_image": tmp_image,
+    #         "path_image": tmp_imglist,
+    #     }
+
+
+    # def __getitem__(self, index):
+
+    #     image_list = []
+    #     tmp_imglist = []
+    #     cur_scene_video = self.scene_videos[index]
+    #     for i in range(self.return_len):
+    #         cur_index = cur_scene_video[i]
+    #         cur_image = self.data_images[cur_index]
+    #         image_list.append(cur_image['image'])
+    #         tmp_imglist.append(cur_image['file_path_'])
+
+    #     image = np.stack(image_list, axis=0)
+    #     image = torch.as_tensor(image)
+
+    #     tmp_image = []
+    #     for tmp_img in tmp_imglist:
+    #         tmp = Image.open(tmp_img).convert("RGB")
+    #         tmp = self.vis_processor(tmp)
+    #         tmp_image.append(tmp)
+    #     tmp_image = torch.stack(tmp_image, dim=0)
+        
+    #     return {
+    #         # "question": question,
+    #         # "answer": answer,
+    #         "image": image,
+    #         "tmp_image": tmp_image,
+    #         "path_image": tmp_imglist,
+    #     }
+
+
+    def __getitem__(self, index):
+        # length_is_valid = True
+        occ, meta = self.point_cloud_dataset[index]
+
+        # get ego pose
+        text_tokens = []
+        for gt_pose in meta["gt_ego_poses"]:
+            x, y = gt_pose[0], gt_pose[1]
+            text_tokens.append([x, y])
+        text_tokens = np.array(text_tokens)
+        text_tokens = torch.as_tensor(text_tokens)
+
+        text_tokens_mask = []
+        for gt_pose_mask in meta["gt_ego_fut_masks"]:
+            text_tokens_mask.append(gt_pose_mask)
+        text_tokens_mask = np.array(text_tokens_mask)
+        text_tokens_mask = torch.as_tensor(text_tokens_mask)
+
+        occ = torch.from_numpy(occ)
+
+
+        image_list = []
+        tmp_imglist = []
+        cur_scene_video = self.scene_videos[index]
+        for i in range(self.return_len):
+            cur_index = cur_scene_video[i]
+            cur_image = self.data_images[cur_index]
+            image_list.append(cur_image['image'])
+            tmp_imglist.append(cur_image['file_path_'])
+
+        image = np.stack(image_list, axis=0)
+        image = torch.as_tensor(image)
+
+        tmp_image = []
+        for tmp_img in tmp_imglist:
+            tmp = Image.open(tmp_img).convert("RGB")
+            tmp = self.vis_processor(tmp)
+            tmp_image.append(tmp)
+        tmp_image = torch.stack(tmp_image, dim=0)
+
+        gt_ego_poses = torch.as_tensor(self.scene_videos_gt_ego_poses[index])
+        gt_ego_poses_mask = torch.as_tensor(self.scene_videos_gt_ego_poses_mask[index])
+        
+        return {
+            # "question": question,
+            # "answer": answer,
+            "image": image,
+            "tmp_image": tmp_image,
+            "gt_ego_poses": gt_ego_poses,
+            "gt_ego_poses_mask": gt_ego_poses_mask,
+            "path_image": tmp_imglist,
+
+            "input_ids": occ,
+            "labels": copy.deepcopy(occ),
+            "text_tokens": text_tokens,
+            "text_tokens_mask": text_tokens_mask,
+
+        }
+
+
+    def __len__(self):
+        # return (len(self.questions)+len(self.questions))
+        # return len(self.questions)
+        # return len(self.tmp_imglist)
+        # return len(self.nusc_infos)*self.times
+        # return len(self.scene_videos)
+        return len(self.point_cloud_dataset)
+    
+
+    # def collater(self, samples):
+    #     # merge samples into a list for each key
+    #     questions = [s["question"] for s in samples]
+    #     answers = [s["answer"] for s in samples]
+    #     images = [s["image"] for s in samples]
+    #     tmp_images = [s["tmp_image"] for s in samples]
+
+    #     images = torch.stack(images, dim=0)
+    #     tmp_images = torch.stack(tmp_images, dim=0)
+    #     # [][][] -> []
+    #     answers = [item[0] for item in answers]
+
+    #     return {
+    #         "images": images,
+    #         "questions": questions,
+    #         "answers": answers,
+    #         "vfeats": tmp_images,
+    #     }
+
+
+    def collater(self, samples):
+        # merge samples into a list for each key
+        # questions = [s["question"] for s in samples]
+        # answers = [s["answer"] for s in samples]
+        images = [s["image"] for s in samples]
+        tmp_images = [s["tmp_image"] for s in samples]
+        gt_ego_poses = [s["gt_ego_poses"] for s in samples]
+        gt_ego_poses_mask = [s["gt_ego_poses_mask"] for s in samples]
+        text_tokens = [s["text_tokens"] for s in samples]
+        text_tokens_mask = [s["text_tokens_mask"] for s in samples]
+        input_ids = [s["input_ids"] for s in samples]
+
+        images = torch.stack(images, dim=0)
+        tmp_images = torch.stack(tmp_images, dim=0)
+        gt_ego_poses = torch.stack(gt_ego_poses, dim=0)
+        gt_ego_poses_mask = torch.stack(gt_ego_poses_mask, dim=0)
+        text_tokens = torch.stack(text_tokens, dim=0)
+        input_ids = torch.stack(input_ids, dim=0)
+        text_tokens_mask = torch.stack(text_tokens_mask, dim=0)
+
+        # [][][] -> []
+        # answers = [item[0] for item in answers]
+
+        path_images = [s["path_image"] for s in samples]
+
+        return {
+            "images": images,
+            # "questions": questions,
+            # "answers": answers,
+            "vfeats": tmp_images,
+            "path_images": path_images,
+            "gt_ego_poses": gt_ego_poses,
+            "gt_ego_poses_mask": gt_ego_poses_mask,
+            "text_tokens": text_tokens,
+            "text_tokens_mask": text_tokens_mask,
+            "input_ids": input_ids,
+
+        }

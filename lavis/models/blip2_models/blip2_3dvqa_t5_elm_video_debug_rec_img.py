@@ -15,11 +15,51 @@ from peft import LoraConfig, get_peft_model, TaskType
 
 from lavis.models.taming_transformers.main import instantiate_from_config
 from torch.nn import CrossEntropyLoss
+from einops import rearrange
 # from lavis.models.taming_transformers.scripts.reconstruction_usage_origin import stack_reconstructions, custom_to_pil, preprocess_vqgan, preprocess, download_image
 
+# custom tokens
+IMAGE_START = "<image>"
+IMAGE_END = "</image>"
 
-@registry.register_model("blip2_vqa_t5_elm_vqgan")
-class Blip2VQAT5ELMVQGAN(Blip2Base):
+
+def patchify(x, n):
+    """
+    Rearrange the tensor from shape (b, f, h, w, c) to (b, f, h//n, w//n, c*n*n).
+    Args:
+        x: Input tensor of shape (b, f, h, w, c).
+        n: Patch size.
+
+    Returns:
+        Patchified tensor of shape (b, f, h//n, w//n, c*n*n).
+    """
+    # x = rearrange(x, 'b f (n1 h) (n2 w) c -> b (f h w) (n1 n2 c)', n1=n, n2=n)  # cut high res into multiple low res
+    x = rearrange(x, 'b f (h1 n1) (w1 n2) c -> b (f h1 w1) (n1 n2 c)', n1=n, n2=n)
+    return x
+
+
+def unpatchify(x, n, h, w):
+    """
+    Rearrange the tensor from shape (b, f, h//n, w//n, c*n*n) back to (b, f, h, w, c).
+    Args:
+        x: Input tensor of shape (b, f, h//n, w//n, c*n*n).
+        n: Patch size.
+        h: Original height of the tensor.
+        w: Original width of the tensor.
+
+    Returns:
+        Unpatchified tensor of shape (b, f, h, w, c).
+    """
+    new_h = h // n
+    new_w = w // n 
+    x = rearrange(x, 'b (f h1 w1) (n1 n2 c) -> b f (h1 n1) (w1 n2) c', h1=new_h, w1=new_w, n1=n, n2=n)
+    # z_q_predict = rearrange(z_q_predict, 'b (f h w) cnn -> b f h w cnn', )
+
+    return x
+
+
+@registry.register_model("blip2_vqa_t5_elm_video_debug_rec_img")
+class Blip2VQAT5ELMVideoDebugRecImg(Blip2Base):
     """
     BLIP2 T5 model.
     Supported model types:
@@ -98,8 +138,8 @@ class Blip2VQAT5ELMVQGAN(Blip2Base):
             param.requires_grad = False
             param.data = param.data
 
-        self.t5_model.get_output_embeddings().requires_grad_(True)
-        self.t5_model.get_input_embeddings().requires_grad_(True)
+        # self.t5_model.get_output_embeddings().requires_grad_(True)
+        # self.t5_model.get_input_embeddings().requires_grad_(True)
 
         self.t5_proj = nn.Linear(self.Qformer.config.hidden_size, self.t5_model.config.hidden_size)
 
@@ -123,6 +163,34 @@ class Blip2VQAT5ELMVQGAN(Blip2Base):
         self.check = True
 
         # self.init_first_stage_from_ckpt(first_stage_config)
+        
+        self.n_patch = 2
+        self.image_start_chunk = None
+        self.image_end_chunk = None
+
+        self.mid_time = 3
+        self.end_time = 6
+
+
+    def split_occ_and_pose(self, inputs, input_length, pose_length, chunk_length, split=False):
+        """Splits the inputs into occupancy and pose components."""
+        total_length = input_length + pose_length + 2 * chunk_length
+        inputs = torch.split(inputs, total_length, dim=1)
+
+        if split:
+            static_occ_list, dynamic_occ_list, ego_list = [], [], []
+            for inp in inputs:
+                static_occ_list.append(inp[:, :input_length//2])
+                dynamic_occ_list.append(inp[:, input_length//2: input_length])
+                ego_list.append(inp[:, input_length:input_length+pose_length])
+            return torch.cat(static_occ_list, dim=1), torch.cat(dynamic_occ_list, dim=1), torch.cat(ego_list, dim=1)
+        else:
+            occ_list, ego_list = [], []
+            for inp in inputs:
+                occ_list.append(inp[:, :input_length])
+                ego_list.append(inp[:, input_length:input_length+pose_length])
+            return torch.cat(occ_list, dim=1), torch.cat(ego_list, dim=1)
+        
 
     def register_vqgan(self, first_stage_config):
         self.init_first_stage_from_ckpt(first_stage_config)
@@ -135,9 +203,23 @@ class Blip2VQAT5ELMVQGAN(Blip2Base):
         # self.vqgan_head = nn.Sequential(nn.Linear(self.t5_model.config.hidden_size, 128, bias=False),
         #                                 nn.Linear(128, 16*16*1024, bias=False))
 
-        self.vqgan_adapter = nn.Linear(256, self.t5_model.config.hidden_size)
-        self.vqgan_head = nn.Linear(self.t5_model.config.hidden_size, 1024)
+        self.vqgan_adapter = nn.Linear(256*self.n_patch*self.n_patch, self.t5_model.config.hidden_size)
+        self.vqgan_head = nn.Linear(self.t5_model.config.hidden_size, self.n_patch*self.n_patch*1024)
 
+
+    # @ torch.no_grad()
+    def get_tokenized_chunks(self, tokens, inputs):
+        assert self.t5_tokenizer is not None, "Error tokenizer is None!"
+        chunks = []
+        for token in tokens:
+            chunk = self.t5_tokenizer(token).input_ids  
+            # print(chunk)
+            chunk = torch.tensor(chunk[2], dtype=torch.long, device=inputs.device)  # chunk[1:3]
+            chunk = self.t5_model.encoder.embed_tokens(chunk)
+            chunk = chunk.unsqueeze(0).expand(inputs.shape[0], -1, -1)
+            chunks.append(chunk)
+        return chunks   
+    
 
     def init_first_stage_from_ckpt(self, config):
         model = instantiate_from_config(config)
@@ -323,17 +405,29 @@ class Blip2VQAT5ELMVQGAN(Blip2Base):
     #         return {"loss": loss}
 
     def forward(self, samples):
-        img_feats = samples["images"]
-        img_feats = img_feats.permute(0, 3, 1, 2)
+        img_feats = samples["images"].unsqueeze(1)
+        img_feats = img_feats.permute(0, 1, 4, 2, 3).contiguous()
+        B, F, D_in, H, W = img_feats.shape
+
+        # get chunks
+        if self.image_start_chunk is None or self.image_end_chunk is None:
+            chunks = self.get_tokenized_chunks([IMAGE_START, IMAGE_END], img_feats)
+            self.image_start_chunk = chunks[0]
+            self.image_end_chunk = chunks[1]
+
+        img_feats = img_feats.view(B*F, D_in, H, W)
+
         # _, z_indices = self.encode_to_z(img_feats)
         quant_z, z_indices = self.encode_to_z(img_feats)
+        _, D, _, _ = quant_z.shape
 
-        targets = z_indices
+        targets = z_indices.view(quant_z.shape[0], quant_z.shape[2], quant_z.shape[3]).contiguous()
 
-        h = self.first_stage_model.encoder(img_feats)
+        # hidden_img_feats = self.first_stage_model.encoder(img_feats)
 
         # for name, param in self.first_stage_model.named_parameters():
         #     print(f'Parameter name: {name}, Requires gradient: {param.requires_grad}')
+
 
         # if self.check:
         #     print(samples["questions"])
@@ -395,8 +489,23 @@ class Blip2VQAT5ELMVQGAN(Blip2Base):
 
         # inputs_t5 = self.t5_proj(t5_query)
         # inputs_t5 = self.vqgan_adapter(h.view(B, 1, -1))
-        h = h.permute(0, 2, 3, 1).contiguous()
-        inputs_t5 = self.vqgan_adapter(h.view(B, -1, 256))
+        hidden_img_feats = quant_z.permute(0, 2, 3, 1).contiguous()
+        hidden_img_feats = hidden_img_feats.view(B, F, *hidden_img_feats.shape[1:])
+        
+        patchified_inputs = []
+        for f in range(F):
+            patchified_input = patchify(hidden_img_feats[:, f:f+1], self.n_patch)
+            patchified_length = patchified_input.shape[1]
+            patchified_input = self.vqgan_adapter(patchified_input)
+            patchified_input = torch.cat((self.image_start_chunk, patchified_input, self.image_end_chunk), dim=1)
+            patchified_inputs.append(patchified_input)
+
+        # num_input_frames = 3
+        # num_pred_frames = 3
+        patchified_inputs = torch.stack(patchified_inputs, dim=1)
+        # inputs_t5 = patchified_inputs[:, :self.mid_time]
+        inputs_t5 = patchified_inputs
+        inputs_t5 = inputs_t5.view(B, -1, inputs_t5.shape[-1])
         atts_t5 = torch.ones(inputs_t5.size()[:-1], dtype=torch.long).to(device)
         
         # answers = samples["answers"]
@@ -467,11 +576,14 @@ class Blip2VQAT5ELMVQGAN(Blip2Base):
             
             # )
 
-            decoder_inputs_embeds_first_pad = self.t5_model.decoder.embed_tokens(torch.tensor([0], device=h.device))
-            decoder_inputs_embeds_first_pad = decoder_inputs_embeds_first_pad[None, :, :].expand([B, -1, -1])
-            quant_z = quant_z.permute(0, 2, 3, 1).contiguous().view(B, -1, 256)
-            embeds_quant_z = self.vqgan_adapter(quant_z)
-            decoder_inputs_embeds_quant_z = torch.cat([decoder_inputs_embeds_first_pad, embeds_quant_z[:, :-1]], dim=1)
+            # decoder_inputs_embeds_first_pad = self.t5_model.decoder.embed_tokens(torch.tensor([0], device=img_feats.device))
+            # decoder_inputs_embeds_first_pad = decoder_inputs_embeds_first_pad[None, :, :].expand([B, -1, -1])
+            # quant_z = quant_z.permute(0, 2, 3, 1).contiguous().view(B, -1, 256)
+            # embeds_quant_z = self.vqgan_adapter(quant_z)
+            # decoder_inputs_embeds_quant_z = patchified_inputs[:, self.mid_time:]
+            decoder_inputs_embeds_quant_z = patchified_inputs
+            decoder_inputs_embeds_quant_z = decoder_inputs_embeds_quant_z.view(B, -1, decoder_inputs_embeds_quant_z.shape[-1])
+            # decoder_inputs_embeds_quant_z = torch.cat([decoder_inputs_embeds_first_pad, decoder_inputs_embeds_quant_z[:, :-1]], dim=1)
             sequence_output = self.t5_model(
                 inputs_embeds=inputs_embeds,
                 attention_mask=encoder_atts,
@@ -483,10 +595,24 @@ class Blip2VQAT5ELMVQGAN(Blip2Base):
             
             )
 
+            sequence_output_logits, ego_logits = self.split_occ_and_pose(
+                sequence_output, patchified_length, 0, self.image_start_chunk.shape[1], split=False)
+
+            # labels = targets.view(B, F, -1)[:, self.mid_time:].contiguous()
+
+            # label patchify
+            targets = rearrange(
+                targets, 
+                '(b f) (h1 n1) (w1 n2) -> b f (h1 w1) (n1 n2)', 
+                b=B, n1=self.n_patch, n2=self.n_patch
+            )
+            # labels = targets[:, self.mid_time:].contiguous()
             labels = targets
+
             reduction = "mean"
-            lm_logits = self.vqgan_head(sequence_output)
-            lm_logits = lm_logits.view(B, 16*16, 1024)
+            sequence_output_logits = self.vqgan_head(sequence_output_logits)
+            sequence_output_logits = rearrange(sequence_output_logits, 'b fhw (nn c) -> b fhw nn c', nn=self.n_patch*self.n_patch)
+            lm_logits = sequence_output_logits.contiguous()
 
             # index = lm_logits.detach().argmax(dim=-1) 
 
@@ -605,203 +731,56 @@ class Blip2VQAT5ELMVQGAN(Blip2Base):
             output_text = self.t5_tokenizer.batch_decode(outputs, skip_special_tokens=True)
 
         return output_text
-
-    # def predict_answers(
-    #     self,
-    #     samples,
-    #     num_beams=5,
-    #     inference_method="generate",
-    #     max_len=10,
-    #     min_len=1,
-    #     num_ans_candidates=128,
-    #     answer_list=None,
-    #     prompt="",
-    #     length_penalty=-1,
-    #     **kwargs,
-    # ):
-
-    #     img_feats = samples["images"]
-    #     img_feats = img_feats.permute(0, 3, 1, 2)
-
-    #     h = self.first_stage_model.encoder(img_feats)
-
-    #     # if self.check:
-    #     #     print(samples["questions"][0])
-    #     #     print(samples["answers"][0])
-    #     #     self.check = False
-            
-    #     device = samples["vfeats"].device
-    #     vfeats = samples["vfeats"]
-
-    #     #########################
-    #     vfeats = vfeats.squeeze(1)
-    #     #########################
-
-    #     B = vfeats.shape[0]
-    #     device = vfeats.device
-        
-    #     # with self.maybe_autocast():
-    #     #     if vfeats.dim() == 4:
-    #     #         image_embeds = self.ln_vision(self.visual_encoder(vfeats))
-    #     #         image_atts = torch.ones(image_embeds.size()[:-1], dtype=torch.long).to(device) # [2, 128]
-    #     #         query_tokens = self.query_tokens.expand(image_embeds.shape[0], -1, -1)
-    #     #         query_output = self.Qformer.bert(
-    #     #                 query_embeds=query_tokens,
-    #     #                 encoder_hidden_states=image_embeds,
-    #     #                 encoder_attention_mask=image_atts,
-    #     #                 return_dict=True,)
-
-    #     #         t5_query = query_output.last_hidden_state
-    #     #     else:
-    #     #         if "timesteps" in samples:
-    #     #             timesteps = samples["timesteps"].to(device)
-    #     #         else:
-    #     #             Time = vfeats.shape[1]
-    #     #             timesteps = 0
-    #     #         tmp_list = []
-    #     #         index = 0
-    #     #         for adj_img in vfeats[:,:-1,...].split(1, dim=1):
-    #     #             adj_img = adj_img.squeeze(1)
-    #     #             image_embeds = self.ln_vision(self.visual_encoder(adj_img))
-    #     #             image_embeds = self.slot_attention(image_embeds)
-    #     #             tmp_list.append(torch.unsqueeze(image_embeds, dim=1))
-                
-    #     #         image_embeds = self.ln_vision(self.visual_encoder(vfeats[:,-1,...]))
-    #     #         image_embeds = self.slot_attention(image_embeds)
-    #     #         tmp_list.append(torch.unsqueeze(image_embeds, dim=1))
-                
-    #     #         tmp_query = torch.cat(tmp_list, dim=1)
-    #     #         tmp_query = tmp_query.reshape(tmp_query.shape[0], -1, tmp_query.shape[-1])
-    #     #         image_atts = torch.ones(tmp_query.size()[:-1], dtype=torch.long).to(device) # [2, 128]
-
-    #     #         query_tokens = torch.cat([self.query_tokens, self.extra_query_tokens], dim=1)
-    #     #         query_tokens = query_tokens.expand(tmp_query.shape[0], -1, -1)
-    #     #         query_output = self.Qformer.bert(
-    #     #                 query_embeds=query_tokens,
-    #     #                 encoder_hidden_states=tmp_query,
-    #     #                 encoder_attention_mask=image_atts,
-    #     #                 return_dict=True,)
-
-    #     #         t5_query = query_output.last_hidden_state
-
-    #     # inputs_t5 = self.t5_proj(t5_query)
-    #     inputs_t5 = self.vqgan_adapter(h.view(B, 1, -1))
-    #     atts_t5 = torch.ones(inputs_t5.size()[:-1], dtype=torch.long).to(device)
-        
-    #     # text_input = samples["questions"]
-    #     with torch.cuda.amp.autocast(dtype=torch.float32):
-    #         # input_tokens = self.t5_tokenizer( # 8 x 17
-    #         #     text_input,
-    #         #     padding="longest",
-    #         #     truncation=True,
-    #         #     max_length=300,
-    #         #     return_tensors="pt",
-    #         # ).to(device)
-
-    #         batch_input_tokens_input_ids = []
-    #         batch_input_tokens_atts = []
-    #         batch_atts_t5 = []
-    #         batch_inputs_t5 = []
-
-    #         for b, _ in enumerate(range(B)):
-    #             # batch_input_tokens_input_ids += [input_tokens.input_ids[b]]
-    #             # batch_input_tokens_atts += [input_tokens.attention_mask[b]]
-    #             batch_atts_t5 += [atts_t5[b]]
-    #             batch_inputs_t5 += [inputs_t5[b]]
-
-    #         # batch_input_tokens_input_ids = torch.stack(batch_input_tokens_input_ids, dim=0)
-    #         # batch_input_tokens_atts = torch.stack(batch_input_tokens_atts, dim=0)
-    #         batch_atts_t5 = torch.stack(batch_atts_t5, dim=0)
-    #         batch_inputs_t5 = torch.stack(batch_inputs_t5, dim=0)
-
-    #         # encoder_atts = torch.cat([batch_atts_t5, batch_input_tokens_atts], dim=1)
-    #         encoder_atts = batch_atts_t5
-
-    #         # inputs_embeds = self.t5_model.encoder.embed_tokens(batch_input_tokens_input_ids)
-    #         # inputs_embeds = torch.cat([batch_inputs_t5, inputs_embeds], dim=1)
-    #         inputs_embeds = batch_inputs_t5
-
-    #         # outputs = self.t5_model.generate(
-    #         #     inputs_embeds=inputs_embeds,
-    #         #     attention_mask=encoder_atts,
-    #         #     do_sample=False,
-    #         #     num_beams=num_beams,
-    #         #     max_new_tokens=max_len,
-    #         #     min_length=1,
-    #         #     length_penalty=-1,
-    #         # )
-    #         # output_text = self.t5_tokenizer.batch_decode(outputs, skip_special_tokens=True)
-
-    #         targets_hold_place = torch.ones([B, 1], dtype=torch.long, device=inputs_embeds.device)
-    #         sequence_output = self.t5_model(
-    #             inputs_embeds=inputs_embeds,
-    #             attention_mask=encoder_atts,
-    #             # decoder_attention_mask=output_tokens.attention_mask,
-    #             return_dict=True,
-    #             labels=targets_hold_place,
-                
-    #             vqgan=True,
-            
-    #         )
-
-    #         lm_logits = self.vqgan_head(sequence_output)
-    #         lm_logits = lm_logits.view(B, 16*16, 1024)
-
-    #         index = lm_logits.detach().argmax(dim=-1)  # 1, 
-    #         quant_z = self.first_stage_model.quantize.get_codebook_entry(
-    #             index.reshape(-1), shape=(B, 16, 16, 256))
-    #         reconstructed_img = self.first_stage_model.decode(quant_z)
-
-    #     # img_feats = samples["images"]
-    #     # img_feats = img_feats.permute(0, 3, 1, 2)
-
-    #     # _, z_indices = self.encode_to_z(img_feats)
-    #     # targets = z_indices
-    #     # quant_z = self.first_stage_model.quantize.get_codebook_entry(
-    #     #     targets.reshape(-1), shape=(B, 24, 24, 256))
-    #     # reconstructed_img = self.first_stage_model.decode(quant_z)
-
-    #     # quant_z, z_indices = self.encode_to_z(img_feats)
-    #     # targets = z_indices
-    #     # reconstructed_img = self.first_stage_model.decode(quant_z)        
-
-    #     titles=["Input", "VQGAN (f16, 1024)"]
-    #     input_img = samples['images'][0]
-    #     path = samples['path_images']
-    #     size = 256
-
-    #     x_vqgan_list = []
-    #     for cur_path in path:
-    #         cur_x_vqgan = preprocess(download_image(cur_path[0]), target_image_size=size, map_dalle=False)
-    #         cur_x_vqgan = cur_x_vqgan.to(img_feats.device)
-    #         x_vqgan_list.append(cur_x_vqgan)
-    #     x_vqgan = torch.stack(x_vqgan_list)
-
-    #     # quant_z, z_indices = self.encode_to_z(x_vqgan)
-    #     # targets = z_indices
-    #     # reconstructed_img = self.first_stage_model.decode(quant_z)
-
-    #     img_0 = stack_reconstructions(custom_to_pil(preprocess_vqgan(x_vqgan[0][0])), 
-    #                                 custom_to_pil(reconstructed_img[0]), titles=titles)
-
-    #     img_1 = stack_reconstructions(custom_to_pil(preprocess_vqgan(x_vqgan[1][0])), 
-    #                                 custom_to_pil(reconstructed_img[0]), titles=titles)
-        
-    #     img_2 = stack_reconstructions(custom_to_pil(preprocess_vqgan(x_vqgan[2][0])), 
-    #                                 custom_to_pil(reconstructed_img[0]), titles=titles)
-
-    #     img_3 = stack_reconstructions(custom_to_pil(preprocess_vqgan(x_vqgan[3][0])), 
-    #                                 custom_to_pil(reconstructed_img[0]), titles=titles)
-
-
-
-    #     # if self._apply_lemmatizer:
-    #     #     output_text_new = self._lemmatize(output_text)
-    #     #     output_text = output_text_new
-    #     # return output_text
-
-    #     return reconstructed_img
     
+
+    def post_process(self, z_q, un_flat=False):
+        # inputs: occ -> encode
+        # labels: occ -> encode -> min_indices
+        # logits: predicted occ
+        # new logits: logits -> argmax -> 1 index -> codebook -> 2 occ code -> 3 occ adapter
+        # z_q = rearrange(z_q, 'b (h w) (f c) -> b f h w c', f=f, h=50, w=50)
+        # z_q = z_q[:, -1:].clone().detach().argmax(dim=-1)  # 1, 
+
+        # z_q = z_q.detach().argmax(dim=-1)  # 1, 
+        # z_q = self.occ_vae.vqvae.get_codebook_entry(z_q, shape=None)   # 2
+        # if not un_flat:
+        #     z_q = rearrange(z_q, 'b f h w c -> (b f) c h w')
+
+        z_q = z_q.detach().argmax(dim=-1)  # 1, 
+        z_q = self.first_stage_model.quantize.get_codebook_entry(
+            z_q, shape=None)
+        if not un_flat:
+            z_q = rearrange(z_q, 'b f h w c -> (b f) c h w')
+
+        return z_q    
+
+    def get_pred(self, logits, dynamic=None):
+        z_q_predict = unpatchify(logits, self.n_patch, self.n_patch, self.n_patch)
+        if dynamic is None:
+            z_q_predict = self.post_process(z_q_predict, un_flat=True)
+        else:
+            z_q_predict = self.post_process_split_dynamic(z_q_predict, un_flat=True, dynamic=dynamic)
+        z_q_predict = patchify(z_q_predict, self.n_patch)
+        z_q_predict = self.vqgan_adapter(z_q_predict)  # cnn -> 4096
+        return z_q_predict
+    
+    # def get_pred_output(self, occ_logits, latent_shape, shape1, shape2, dynamic=None):
+    #     z_q = unpatchify(occ_logits, self.n_patch, latent_shape[0], latent_shape[1])
+    #     if dynamic is None:
+    #         z_q = self.post_process(z_q, un_flat=False)
+    #         z_q = self.decode_occ(z_q, shape1, shape2)
+    #     else:
+    #         z_q = self.post_process_split_dynamic(z_q, un_flat=False, dynamic=dynamic)
+    #         z_q = self.decode_occ_split_dynamic(z_q, shape1, shape2, dynamic=dynamic)
+    #     return z_q
+    
+    def get_pred_output(self, occ_logits, latent_shape):
+        z_q = unpatchify(occ_logits, self.n_patch, latent_shape[0], latent_shape[1])
+        z_q = self.post_process(z_q, un_flat=False)
+        z_q = self.first_stage_model.decode(z_q)
+
+        return z_q
+
 
     def predict_answers(
         self,
@@ -817,10 +796,28 @@ class Blip2VQAT5ELMVQGAN(Blip2Base):
         **kwargs,
     ):
 
-        img_feats = samples["images"]
-        img_feats = img_feats.permute(0, 3, 1, 2)
+        img_feats = samples["images"].unsqueeze(1)
+        img_feats = img_feats.permute(0, 1, 4, 2, 3).contiguous()
+        B, F, D_in, H, W = img_feats.shape
 
-        h = self.first_stage_model.encoder(img_feats)
+        # get chunks
+        if self.image_start_chunk is None or self.image_end_chunk is None:
+            chunks = self.get_tokenized_chunks([IMAGE_START, IMAGE_END], img_feats)
+            self.image_start_chunk = chunks[0]
+            self.image_end_chunk = chunks[1]
+
+        img_feats = img_feats.view(B*F, D_in, H, W)
+
+        # _, z_indices = self.encode_to_z(img_feats)
+        quant_z, z_indices = self.encode_to_z(img_feats)
+        _, D, _, _ = quant_z.shape
+
+        targets = z_indices.reshape(quant_z.shape[0], quant_z.shape[2], quant_z.shape[3])
+        gt_z_q = self.first_stage_model.quantize.get_codebook_entry(targets, shape=None)
+        gt_z_q = gt_z_q.permute(0, 3, 1, 2).contiguous()
+        gt_z_q = self.first_stage_model.decode(gt_z_q)
+
+        # h = self.first_stage_model.encoder(img_feats)
 
         # if self.check:
         #     print(samples["questions"][0])
@@ -882,8 +879,25 @@ class Blip2VQAT5ELMVQGAN(Blip2Base):
         #         t5_query = query_output.last_hidden_state
 
         # inputs_t5 = self.t5_proj(t5_query)
-        h = h.permute(0, 2, 3, 1).contiguous()
-        inputs_t5 = self.vqgan_adapter(h.view(B, -1, 256))
+        # inputs_t5 = self.vqgan_adapter(h.view(B, 1, -1))
+        hidden_img_feats = quant_z.permute(0, 2, 3, 1).contiguous()
+        hidden_img_feats = hidden_img_feats.view(B, F, *hidden_img_feats.shape[1:])
+        latent_shape = hidden_img_feats.shape[2:4]  # get original latent h and w
+        
+        patchified_inputs = []
+        for f in range(F):
+            patchified_input = patchify(hidden_img_feats[:, f:f+1], self.n_patch)
+            patchified_length = patchified_input.shape[1]
+            patchified_input = self.vqgan_adapter(patchified_input)
+            patchified_input = torch.cat((self.image_start_chunk, patchified_input, self.image_end_chunk), dim=1)
+            patchified_inputs.append(patchified_input)
+
+        # num_input_frames = 3
+        # num_pred_frames = 3
+        patchified_inputs = torch.stack(patchified_inputs, dim=1)
+        # inputs_t5 = patchified_inputs[:, :self.mid_time]
+        inputs_t5 = patchified_inputs
+        inputs_t5 = inputs_t5.view(B, -1, inputs_t5.shape[-1])
         atts_t5 = torch.ones(inputs_t5.size()[:-1], dtype=torch.long).to(device)
         
         # text_input = samples["questions"]
@@ -931,35 +945,63 @@ class Blip2VQAT5ELMVQGAN(Blip2Base):
             # output_text = self.t5_tokenizer.batch_decode(outputs, skip_special_tokens=True)
 
 
-            decoder_inputs_embeds_first_pad = self.t5_model.decoder.embed_tokens(torch.tensor([0], device=h.device))
-            decoder_inputs_embeds_first_pad = decoder_inputs_embeds_first_pad[None, :, :].expand([B, -1, -1])
-            decoder_inputs_embeds_quant_z = decoder_inputs_embeds_first_pad
+            # decoder_inputs_embeds_first_pad = self.t5_model.decoder.embed_tokens(torch.tensor([0], device=h.device))
+            # decoder_inputs_embeds_first_pad = decoder_inputs_embeds_first_pad[None, :, :].expand([B, -1, -1])
+            # decoder_inputs_embeds_quant_z = decoder_inputs_embeds_first_pad
             quant_z_list = []
-            for cur_token in range(256):
-                sequence_output = self.t5_model(
-                    inputs_embeds=inputs_embeds,
-                    attention_mask=encoder_atts,
-                    # decoder_attention_mask=output_tokens.attention_mask,
-                    return_dict=True,
-                    decoder_inputs_embeds=decoder_inputs_embeds_quant_z,
-                                    
-                    vqgan=True,
+            for cur_time in range(1):
+                if cur_time == 0:
+                    decoder_inputs_embeds_quant_z = self.image_start_chunk
+                else:
+                    decoder_inputs_embeds_quant_z = torch.cat((decoder_inputs_embeds_quant_z, self.image_start_chunk), dim=1)  # add new start
                 
-                )
+                for _ in range(patchified_length):
+                    sequence_output = self.t5_model(
+                        inputs_embeds=inputs_embeds,
+                        attention_mask=encoder_atts,
+                        # decoder_attention_mask=output_tokens.attention_mask,
+                        return_dict=True,
+                        decoder_inputs_embeds=decoder_inputs_embeds_quant_z,
+                                        
+                        vqgan=True,
+                    
+                    )
 
-                lm_logits = self.vqgan_head(sequence_output[:, -1])
-                index = lm_logits.detach().argmax(dim=-1)  # 1, 
-                cur_quant_z = self.first_stage_model.quantize.get_codebook_entry(
-                    index.reshape(-1), shape=None)
-                cur_quant_z = cur_quant_z[:, None, :]
-                quant_z_list.append(cur_quant_z)
+                    lm_logits = self.vqgan_head(sequence_output[:, -1:])
 
-                cur_quant_z_embeds = self.vqgan_adapter(cur_quant_z)
-                decoder_inputs_embeds_quant_z = torch.cat([decoder_inputs_embeds_quant_z, cur_quant_z_embeds], dim=1)
+                    # index = lm_logits.detach().argmax(dim=-1)  # 1, 
+                    # cur_quant_z = self.first_stage_model.quantize.get_codebook_entry(
+                    #     index.reshape(-1), shape=None)
+                    # cur_quant_z = cur_quant_z[:, None, :]
+                    # quant_z_list.append(cur_quant_z)
+                    # cur_quant_z_embeds = self.vqgan_adapter(cur_quant_z)
 
-        quant_z = torch.cat(quant_z_list, dim=1)
-        quant_z = quant_z.permute(0, 2, 1).contiguous().view(B, 256, 16, 16)
-        reconstructed_img = self.first_stage_model.decode(quant_z)
+                    cur_quant_z_embeds = self.get_pred(lm_logits, dynamic=None)
+                    decoder_inputs_embeds_quant_z = torch.cat([decoder_inputs_embeds_quant_z, cur_quant_z_embeds], dim=1)
+
+                decoder_inputs_embeds_quant_z = torch.cat((decoder_inputs_embeds_quant_z, self.image_end_chunk), dim=1)  # add new end
+
+        sequence_output = self.t5_model(
+            inputs_embeds=inputs_embeds,
+            attention_mask=encoder_atts,
+            # decoder_attention_mask=output_tokens.attention_mask,
+            return_dict=True,
+            decoder_inputs_embeds=decoder_inputs_embeds_quant_z,
+                            
+            vqgan=True,
+        
+        )
+
+        sequence_output_logits, ego_logits = self.split_occ_and_pose(
+            sequence_output, patchified_length, 0, self.image_start_chunk.shape[1], split=False)
+
+        sequence_output_logits = self.vqgan_head(sequence_output_logits)
+        z_q = self.get_pred_output(sequence_output_logits, latent_shape).detach()
+        reconstructed_img = z_q
+
+        # quant_z = torch.cat(quant_z_list, dim=1)
+        # quant_z = quant_z.permute(0, 2, 1).contiguous().view(B, 256, 16, 16)
+        # reconstructed_img = self.first_stage_model.decode(quant_z)
 
         # img_feats = samples["images"]
         # img_feats = img_feats.permute(0, 3, 1, 2)
@@ -974,7 +1016,7 @@ class Blip2VQAT5ELMVQGAN(Blip2Base):
         # targets = z_indices
         # reconstructed_img = self.first_stage_model.decode(quant_z)        
 
-        titles=["Input", "VQGAN (f16, 1024)"]
+        titles=["Input", "VQGAN (f16, 1024)", "LLM"]
         input_img = samples['images'][0]
         path = samples['path_images']
         size = 256
@@ -990,16 +1032,16 @@ class Blip2VQAT5ELMVQGAN(Blip2Base):
         # targets = z_indices
         # reconstructed_img = self.first_stage_model.decode(quant_z)
 
-        img_0 = stack_reconstructions(custom_to_pil(preprocess_vqgan(x_vqgan[0][0])), 
+        img_0 = stack_reconstructions(custom_to_pil(preprocess_vqgan(x_vqgan[0][0])), custom_to_pil(gt_z_q[0]), 
                                     custom_to_pil(reconstructed_img[0]), titles=titles)
 
-        img_1 = stack_reconstructions(custom_to_pil(preprocess_vqgan(x_vqgan[1][0])), 
+        img_1 = stack_reconstructions(custom_to_pil(preprocess_vqgan(x_vqgan[1][0])), custom_to_pil(gt_z_q[1]), 
                                     custom_to_pil(reconstructed_img[1]), titles=titles)
         
-        img_2 = stack_reconstructions(custom_to_pil(preprocess_vqgan(x_vqgan[2][0])), 
+        img_2 = stack_reconstructions(custom_to_pil(preprocess_vqgan(x_vqgan[2][0])), custom_to_pil(gt_z_q[2]), 
                                     custom_to_pil(reconstructed_img[2]), titles=titles)
 
-        img_3 = stack_reconstructions(custom_to_pil(preprocess_vqgan(x_vqgan[3][0])), 
+        img_3 = stack_reconstructions(custom_to_pil(preprocess_vqgan(x_vqgan[3][0])), custom_to_pil(gt_z_q[3]), 
                                     custom_to_pil(reconstructed_img[3]), titles=titles)
 
 
@@ -1011,6 +1053,277 @@ class Blip2VQAT5ELMVQGAN(Blip2Base):
 
         return reconstructed_img
         
+
+    # def predict_answers(
+    #     self,
+    #     samples,
+    #     num_beams=5,
+    #     inference_method="generate",
+    #     max_len=10,
+    #     min_len=1,
+    #     num_ans_candidates=128,
+    #     answer_list=None,
+    #     prompt="",
+    #     length_penalty=-1,
+    #     **kwargs,
+    # ):
+
+    #     img_feats = samples["images"]
+    #     img_feats = img_feats.permute(0, 1, 4, 2, 3).contiguous()
+    #     B, F, D_in, H, W = img_feats.shape
+
+    #     # get chunks
+    #     if self.image_start_chunk is None or self.image_end_chunk is None:
+    #         chunks = self.get_tokenized_chunks([IMAGE_START, IMAGE_END], img_feats)
+    #         self.image_start_chunk = chunks[0]
+    #         self.image_end_chunk = chunks[1]
+
+    #     img_feats = img_feats.view(B*F, D_in, H, W)
+
+    #     # _, z_indices = self.encode_to_z(img_feats)
+    #     quant_z, z_indices = self.encode_to_z(img_feats)
+    #     _, D, _, _ = quant_z.shape
+
+    #     targets = z_indices
+
+    #     # h = self.first_stage_model.encoder(img_feats)
+
+    #     # if self.check:
+    #     #     print(samples["questions"][0])
+    #     #     print(samples["answers"][0])
+    #     #     self.check = False
+            
+    #     device = samples["vfeats"].device
+    #     vfeats = samples["vfeats"]
+
+    #     #########################
+    #     vfeats = vfeats.squeeze(1)
+    #     #########################
+
+    #     B = vfeats.shape[0]
+    #     device = vfeats.device
+        
+    #     # with self.maybe_autocast():
+    #     #     if vfeats.dim() == 4:
+    #     #         image_embeds = self.ln_vision(self.visual_encoder(vfeats))
+    #     #         image_atts = torch.ones(image_embeds.size()[:-1], dtype=torch.long).to(device) # [2, 128]
+    #     #         query_tokens = self.query_tokens.expand(image_embeds.shape[0], -1, -1)
+    #     #         query_output = self.Qformer.bert(
+    #     #                 query_embeds=query_tokens,
+    #     #                 encoder_hidden_states=image_embeds,
+    #     #                 encoder_attention_mask=image_atts,
+    #     #                 return_dict=True,)
+
+    #     #         t5_query = query_output.last_hidden_state
+    #     #     else:
+    #     #         if "timesteps" in samples:
+    #     #             timesteps = samples["timesteps"].to(device)
+    #     #         else:
+    #     #             Time = vfeats.shape[1]
+    #     #             timesteps = 0
+    #     #         tmp_list = []
+    #     #         index = 0
+    #     #         for adj_img in vfeats[:,:-1,...].split(1, dim=1):
+    #     #             adj_img = adj_img.squeeze(1)
+    #     #             image_embeds = self.ln_vision(self.visual_encoder(adj_img))
+    #     #             image_embeds = self.slot_attention(image_embeds)
+    #     #             tmp_list.append(torch.unsqueeze(image_embeds, dim=1))
+                
+    #     #         image_embeds = self.ln_vision(self.visual_encoder(vfeats[:,-1,...]))
+    #     #         image_embeds = self.slot_attention(image_embeds)
+    #     #         tmp_list.append(torch.unsqueeze(image_embeds, dim=1))
+                
+    #     #         tmp_query = torch.cat(tmp_list, dim=1)
+    #     #         tmp_query = tmp_query.reshape(tmp_query.shape[0], -1, tmp_query.shape[-1])
+    #     #         image_atts = torch.ones(tmp_query.size()[:-1], dtype=torch.long).to(device) # [2, 128]
+
+    #     #         query_tokens = torch.cat([self.query_tokens, self.extra_query_tokens], dim=1)
+    #     #         query_tokens = query_tokens.expand(tmp_query.shape[0], -1, -1)
+    #     #         query_output = self.Qformer.bert(
+    #     #                 query_embeds=query_tokens,
+    #     #                 encoder_hidden_states=tmp_query,
+    #     #                 encoder_attention_mask=image_atts,
+    #     #                 return_dict=True,)
+
+    #     #         t5_query = query_output.last_hidden_state
+
+    #     # inputs_t5 = self.t5_proj(t5_query)
+    #     # inputs_t5 = self.vqgan_adapter(h.view(B, 1, -1))
+    #     hidden_img_feats = quant_z.permute(0, 2, 3, 1).contiguous()
+    #     hidden_img_feats = hidden_img_feats.view(B, F, *hidden_img_feats.shape[1:])
+    #     latent_shape = hidden_img_feats.shape[2:4]  # get original latent h and w
+        
+    #     patchified_inputs = []
+    #     for f in range(F):
+    #         patchified_input = patchify(hidden_img_feats[:, f:f+1], self.n_patch)
+    #         patchified_length = patchified_input.shape[1]
+    #         patchified_input = self.vqgan_adapter(patchified_input)
+    #         patchified_input = torch.cat((self.image_start_chunk, patchified_input, self.image_end_chunk), dim=1)
+    #         patchified_inputs.append(patchified_input)
+
+    #     # num_input_frames = 3
+    #     # num_pred_frames = 3
+    #     patchified_inputs = torch.stack(patchified_inputs, dim=1)
+    #     inputs_t5 = patchified_inputs[:, :self.mid_time]
+    #     inputs_t5 = inputs_t5.view(B, -1, inputs_t5.shape[-1])
+    #     atts_t5 = torch.ones(inputs_t5.size()[:-1], dtype=torch.long).to(device)
+        
+    #     # text_input = samples["questions"]
+    #     with torch.cuda.amp.autocast(dtype=torch.float32):
+    #         # input_tokens = self.t5_tokenizer( # 8 x 17
+    #         #     text_input,
+    #         #     padding="longest",
+    #         #     truncation=True,
+    #         #     max_length=300,
+    #         #     return_tensors="pt",
+    #         # ).to(device)
+
+    #         batch_input_tokens_input_ids = []
+    #         batch_input_tokens_atts = []
+    #         batch_atts_t5 = []
+    #         batch_inputs_t5 = []
+
+    #         for b, _ in enumerate(range(B)):
+    #             # batch_input_tokens_input_ids += [input_tokens.input_ids[b]]
+    #             # batch_input_tokens_atts += [input_tokens.attention_mask[b]]
+    #             batch_atts_t5 += [atts_t5[b]]
+    #             batch_inputs_t5 += [inputs_t5[b]]
+
+    #         # batch_input_tokens_input_ids = torch.stack(batch_input_tokens_input_ids, dim=0)
+    #         # batch_input_tokens_atts = torch.stack(batch_input_tokens_atts, dim=0)
+    #         batch_atts_t5 = torch.stack(batch_atts_t5, dim=0)
+    #         batch_inputs_t5 = torch.stack(batch_inputs_t5, dim=0)
+
+    #         # encoder_atts = torch.cat([batch_atts_t5, batch_input_tokens_atts], dim=1)
+    #         encoder_atts = batch_atts_t5
+
+    #         # inputs_embeds = self.t5_model.encoder.embed_tokens(batch_input_tokens_input_ids)
+    #         # inputs_embeds = torch.cat([batch_inputs_t5, inputs_embeds], dim=1)
+    #         inputs_embeds = batch_inputs_t5
+
+    #         # outputs = self.t5_model.generate(
+    #         #     inputs_embeds=inputs_embeds,
+    #         #     attention_mask=encoder_atts,
+    #         #     do_sample=False,
+    #         #     num_beams=num_beams,
+    #         #     max_new_tokens=max_len,
+    #         #     min_length=1,
+    #         #     length_penalty=-1,
+    #         # )
+    #         # output_text = self.t5_tokenizer.batch_decode(outputs, skip_special_tokens=True)
+
+
+    #         # decoder_inputs_embeds_first_pad = self.t5_model.decoder.embed_tokens(torch.tensor([0], device=h.device))
+    #         # decoder_inputs_embeds_first_pad = decoder_inputs_embeds_first_pad[None, :, :].expand([B, -1, -1])
+    #         # decoder_inputs_embeds_quant_z = decoder_inputs_embeds_first_pad
+    #         # quant_z_list = []
+    #         # for cur_time in range(self.mid_time, self.end_time):
+    #         #     if cur_time == self.mid_time:
+    #         #         decoder_inputs_embeds_quant_z = self.image_start_chunk
+    #         #     else:
+    #         #         decoder_inputs_embeds_quant_z = torch.cat((decoder_inputs_embeds_quant_z, self.image_start_chunk), dim=1)  # add new start
+                
+    #         #     for _ in range(patchified_length):
+    #         #         sequence_output = self.t5_model(
+    #         #             inputs_embeds=inputs_embeds,
+    #         #             attention_mask=encoder_atts,
+    #         #             # decoder_attention_mask=output_tokens.attention_mask,
+    #         #             return_dict=True,
+    #         #             decoder_inputs_embeds=decoder_inputs_embeds_quant_z,
+                                        
+    #         #             vqgan=True,
+                    
+    #         #         )
+
+    #         #         lm_logits = self.vqgan_head(sequence_output[:, -1:])
+
+    #         #         # index = lm_logits.detach().argmax(dim=-1)  # 1, 
+    #         #         # cur_quant_z = self.first_stage_model.quantize.get_codebook_entry(
+    #         #         #     index.reshape(-1), shape=None)
+    #         #         # cur_quant_z = cur_quant_z[:, None, :]
+    #         #         # quant_z_list.append(cur_quant_z)
+    #         #         # cur_quant_z_embeds = self.vqgan_adapter(cur_quant_z)
+
+    #         #         cur_quant_z_embeds = self.get_pred(lm_logits, dynamic=None)
+    #         #         decoder_inputs_embeds_quant_z = torch.cat([decoder_inputs_embeds_quant_z, cur_quant_z_embeds], dim=1)
+
+    #         #     decoder_inputs_embeds_quant_z = torch.cat((decoder_inputs_embeds_quant_z, self.image_end_chunk), dim=1)  # add new end
+
+    #     decoder_inputs_embeds_quant_z = patchified_inputs[:, self.mid_time:]
+    #     decoder_inputs_embeds_quant_z = decoder_inputs_embeds_quant_z.view(B, -1, decoder_inputs_embeds_quant_z.shape[-1])
+
+    #     sequence_output = self.t5_model(
+    #         inputs_embeds=inputs_embeds,
+    #         attention_mask=encoder_atts,
+    #         # decoder_attention_mask=output_tokens.attention_mask,
+    #         return_dict=True,
+    #         decoder_inputs_embeds=decoder_inputs_embeds_quant_z,
+                            
+    #         vqgan=True,
+        
+    #     )
+
+    #     sequence_output_logits, ego_logits = self.split_occ_and_pose(
+    #         sequence_output, patchified_length, 0, self.image_start_chunk.shape[1], split=False)
+
+    #     sequence_output_logits = self.vqgan_head(sequence_output_logits)
+    #     z_q = self.get_pred_output(sequence_output_logits, latent_shape).detach()
+    #     reconstructed_img = z_q
+
+    #     # quant_z = torch.cat(quant_z_list, dim=1)
+    #     # quant_z = quant_z.permute(0, 2, 1).contiguous().view(B, 256, 16, 16)
+    #     # reconstructed_img = self.first_stage_model.decode(quant_z)
+
+    #     # img_feats = samples["images"]
+    #     # img_feats = img_feats.permute(0, 3, 1, 2)
+
+    #     # _, z_indices = self.encode_to_z(img_feats)
+    #     # targets = z_indices
+    #     # quant_z = self.first_stage_model.quantize.get_codebook_entry(
+    #     #     targets.reshape(-1), shape=(B, 24, 24, 256))
+    #     # reconstructed_img = self.first_stage_model.decode(quant_z)
+
+    #     # quant_z, z_indices = self.encode_to_z(img_feats)
+    #     # targets = z_indices
+    #     # reconstructed_img = self.first_stage_model.decode(quant_z)        
+
+    #     titles=["Input", "VQGAN (f16, 1024)"]
+    #     input_img = samples['images'][0]
+    #     path = samples['path_images']
+    #     size = 256
+
+    #     x_vqgan_list = []
+    #     for cur_path in path[0]:
+    #         cur_x_vqgan = preprocess(download_image(cur_path), target_image_size=size, map_dalle=False)
+    #         cur_x_vqgan = cur_x_vqgan.to(img_feats.device)
+    #         x_vqgan_list.append(cur_x_vqgan)
+    #     x_vqgan = torch.stack(x_vqgan_list)
+
+    #     # quant_z, z_indices = self.encode_to_z(x_vqgan)
+    #     # targets = z_indices
+    #     # reconstructed_img = self.first_stage_model.decode(quant_z)
+
+    #     img_0 = stack_reconstructions(custom_to_pil(preprocess_vqgan(x_vqgan[3][0])), 
+    #                                 custom_to_pil(reconstructed_img[0]), titles=titles)
+
+    #     img_1 = stack_reconstructions(custom_to_pil(preprocess_vqgan(x_vqgan[4][0])), 
+    #                                 custom_to_pil(reconstructed_img[1]), titles=titles)
+        
+    #     img_2 = stack_reconstructions(custom_to_pil(preprocess_vqgan(x_vqgan[5][0])), 
+    #                                 custom_to_pil(reconstructed_img[2]), titles=titles)
+
+    #     # img_3 = stack_reconstructions(custom_to_pil(preprocess_vqgan(x_vqgan[3][0])), 
+    #     #                             custom_to_pil(reconstructed_img[3]), titles=titles)
+
+
+
+    #     # if self._apply_lemmatizer:
+    #     #     output_text_new = self._lemmatize(output_text)
+    #     #     output_text = output_text_new
+    #     # return output_text
+
+    #     return reconstructed_img
+
 
     def _lemmatize(self, answers):
         def apply(answer):

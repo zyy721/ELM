@@ -4,7 +4,7 @@
  # For full license text, see the LICENSE file in the repo root or https://opensource.org/licenses/BSD-3-Clause
 
 model:
-  arch: blip2_vqa_t5_elm_vqgan
+  arch: blip2_vqa_t5_elm_video_ego_gt_random_mask
   model_type: pretrain_flant5xl
   use_grad_checkpoint: False
   freeze_vit: False
@@ -44,7 +44,7 @@ model:
 
 
 datasets:
-  elmvqgan: # name of the dataset builder coco_vqa
+  elmvideo: # name of the dataset builder coco_vqa
     vis_processor:
         train:
           name: "blip2_image_train"
@@ -91,7 +91,19 @@ run:
   accum_grad_iters: 2
   # resume_ckpt_path: null
   # resume_ckpt_path: "lavis/output/BLIP2/combine/20240810171/checkpoint_19.pth"
-  resume_ckpt_path: "lavis/output/BLIP2/combine/20240811164/checkpoint_30.pth"
+  # resume_ckpt_path: "lavis/output/BLIP2/combine/20240811164/checkpoint_30.pth"
+  # rec_img
+  # resume_ckpt_path: "lavis/output/BLIP2/combine/20240813194/checkpoint_20.pth"
+  # pred_video
+  # resume_ckpt_path: "lavis/output/BLIP2/combine/20240816173/checkpoint_25.pth" 
+  # pred_video_ego_pose wo autoregressive
+  # resume_ckpt_path: "lavis/output/BLIP2/combine/20240818185/checkpoint_15.pth"
+  # pred_video_ego_pose w autoregressive
+  # resume_ckpt_path: "lavis/output/BLIP2/combine/20240820190/checkpoint_30.pth"
+  # pred_video_ego_gt w autoregressive
+  resume_ckpt_path: "lavis/output/BLIP2/combine/20240824201/checkpoint_40.pth"
+  # pred_video_ego_gt_random_mask w autoregressive
+  # resume_ckpt_path: "lavis/output/BLIP2/combine/20240827210/checkpoint_20.pth"
 
   max_len: 30 # 10
   min_len: 1

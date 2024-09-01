@@ -402,13 +402,14 @@ class RunnerBase:
 
             # evaluation phase
             if len(self.valid_splits) > 0:
-                for split_name in self.valid_splits:
-                    logging.info("Evaluating on {}.".format(split_name))
+                with torch.no_grad():
+                    for split_name in self.valid_splits:
+                        logging.info("Evaluating on {}.".format(split_name))
 
-                    val_log = self.eval_epoch(split_name=split_name, cur_epoch=cur_epoch)
+                        val_log = self.eval_epoch(split_name=split_name, cur_epoch=cur_epoch)
 
-            # if cur_epoch % 4 == 0:
-            self._save_checkpoint(cur_epoch, is_best=False)
+            if cur_epoch % 5 == 0:
+                self._save_checkpoint(cur_epoch, is_best=False)
 
             if self.evaluate_only:
                 break
@@ -483,6 +484,7 @@ class RunnerBase:
                 val_result=results,
                 split_name=split_name,
                 epoch=cur_epoch,
+                model=model,
             )
 
     def unwrap_dist_model(self, model):

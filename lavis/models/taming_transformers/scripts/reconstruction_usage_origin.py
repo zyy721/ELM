@@ -129,15 +129,27 @@ def reconstruct_with_dalle(x, encoder, decoder, do_preprocess=False):
 #     ImageDraw.Draw(img).text((i*w, 0), f'{title}', (255, 255, 255), font=font) # coordinates, text, color, font
 #   return img
 
-def stack_reconstructions(input, x0, titles=[]):
+# def stack_reconstructions(input, x0, titles=[]):
+#   font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuMathTeXGyre.ttf", 22)
+
+#   w, h = input.size[0], input.size[1]
+#   img = Image.new("RGB", (2*w, h))
+#   img.paste(input, (0,0))
+#   img.paste(x0, (1*w,0))
+#   for i, title in enumerate(titles):
+#     ImageDraw.Draw(img).text((i*w, 0), f'{title}', (255, 255, 255), font=font) # coordinates, text, color, fontd
+#   return img
+
+def stack_reconstructions(input, gt, x0, titles=[]):
   font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuMathTeXGyre.ttf", 22)
 
   w, h = input.size[0], input.size[1]
-  img = Image.new("RGB", (2*w, h))
+  img = Image.new("RGB", (3*w, h))
   img.paste(input, (0,0))
-  img.paste(x0, (1*w,0))
+  img.paste(gt, (1*w,0))
+  img.paste(x0, (2*w,0))
   for i, title in enumerate(titles):
-    ImageDraw.Draw(img).text((i*w, 0), f'{title}', (255, 255, 255), font=font) # coordinates, text, color, fontd
+    ImageDraw.Draw(img).text((i*w, 0), f'{title}', (0, 0, 0), font=font) # coordinates, text, color, fontd
   return img
 
 # For faster load times, download these files locally and use the local paths instead.
